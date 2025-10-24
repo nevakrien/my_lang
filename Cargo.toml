@@ -1,0 +1,13 @@
+[package]
+name = "my_lang"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aliasable = "0.1.3"
+once_cell = "1.21.3"
+tempfile = "3.23.0"
+
+# Cargo.toml
+[dev-dependencies]
+fs2 = "0.4"
