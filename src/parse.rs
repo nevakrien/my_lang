@@ -1,7 +1,5 @@
 
 use thiserror::Error;
-use std::fmt;
-use std::error::Error;
 use std::collections::HashMap;
 use std::rc::Rc;
 use crate::input::Source;
@@ -303,6 +301,7 @@ impl<'a> BasicLexer<'a>{
 
 pub type Bp = u32;
 
+#[derive(Debug)]
 pub enum ParseError {
 	LexError(LexError),
 }
@@ -311,6 +310,7 @@ impl From<LexError> for ParseError{
 fn from(e: LexError) -> Self {Self::LexError(e)}
 }
 
+#[derive(Debug, PartialEq)]
 pub enum Value {
 	StringLit(String),
 	IntLit(u64),
@@ -328,6 +328,12 @@ pub struct Lexer<'a>{
 impl<'a> Lexer<'a> {
 	pub fn push(&mut self,text:&'a str,src:Source){
 		self.stack.push(BasicLexer::new(text,src))
+	}
+
+	pub fn new(cur_str:&'a str,src:Source)->Self{
+		let mut ans = Self::default();
+		ans.push(cur_str,src);
+		ans
 	}
 
 	pub fn peek(&mut self)->ParseOpRes<&Located<Token<'a>>>{
@@ -371,7 +377,31 @@ pub struct Parser<'a> {
 	names:HashMap<&'a str,KnowenName>,
 }
 
+macro_rules! binop {
+    ($name:expr, $lbp:expr, $rbp:expr, $infix:expr, $prefix:expr) => {
+        Rc::new(BinOp {
+            name: $name,
+            left_bp: $lbp,
+            right_bp: $rbp,
+            fold_infix: $infix,
+            fold_prefix: $prefix,
+        }) as Rc<dyn ParseElm>
+    };
+}
+
+
 impl<'a> Parser<'a>{
+	 pub fn new_defualt(lexer: Lexer<'a>) -> Self {
+        let mut names = HashMap::new();
+
+        names.insert("+", binop!("+", 10, 11, fold_add, Some(fold_pos)));
+        names.insert("-", binop!("-", 10, 11, fold_sub, Some(fold_neg)));
+        names.insert("*", binop!("*", 20, 21, fold_mul, Some(fold_deref)));
+        names.insert("/", binop!("/", 20, 21, fold_div, None));
+
+        Self { lexer, names }
+    }
+
 	fn exp_parser(&self,name:&str)->ParseRes<KnowenName>{
 		self.names.get(name).ok_or_else(||{todo!()}).cloned()
 	}
@@ -420,6 +450,94 @@ impl<'a> Parser<'a>{
 	}
 }
 
+#[derive(Clone,Copy)]
+pub struct BinOp {
+    pub name: &'static str,
+    pub left_bp: Bp,
+    pub right_bp: Bp,
+    pub fold_infix: fn(Value, Value) -> Result<Value, Located<ParseError>>,
+    pub fold_prefix: Option<fn(Value) -> Result<Value, Located<ParseError>>>,
+}
+
+impl ParseElm for BinOp {
+    fn postfix_bp(&self) -> Option<Bp> {
+        Some(self.left_bp)
+    }
+
+    fn parse_pre(&self, parser: &mut Parser, _min_bp: Bp) -> ParseOpRes {
+        // If this operator *can* be used as a prefix, handle it
+        if let Some(prefix_fn) = self.fold_prefix {
+            let rhs = parser.expr_bp(self.right_bp)?;
+            if let Some(rhs_val) = rhs {
+                return prefix_fn(rhs_val).map(Some);
+            } else {
+                return Ok(None);
+            }
+        }
+
+        // Otherwise it's not valid in prefix position
+        Err(parser.lexer.next()?.unwrap().with(todo!()))
+    }
+
+    fn parse_post(&self, parser: &mut Parser, _min_bp: Bp, lhs: Value) -> ParseRes {
+        let Some(rhs_val) = parser.expr_bp(self.right_bp)? else{
+        	todo!()
+        };
+        
+        (self.fold_infix)(lhs, rhs_val)
+    }
+}
+
+fn fold_add(lhs: Value, rhs: Value) -> Result<Value, Located<ParseError>> {
+    match (lhs, rhs) {
+        (Value::IntLit(a), Value::IntLit(b)) => Ok(Value::IntLit(a + b)),
+        _ => todo!("non-literal addition (build AST node here)"),
+    }
+}
+
+fn fold_sub(lhs: Value, rhs: Value) -> Result<Value, Located<ParseError>> {
+    match (lhs, rhs) {
+        (Value::IntLit(a), Value::IntLit(b)) => Ok(Value::IntLit(a - b)),
+        _ => todo!("non-literal subtraction"),
+    }
+}
+
+fn fold_mul(lhs: Value, rhs: Value) -> Result<Value, Located<ParseError>> {
+    match (lhs, rhs) {
+        (Value::IntLit(a), Value::IntLit(b)) => Ok(Value::IntLit(a * b)),
+        _ => todo!("non-literal multiplication"),
+    }
+}
+
+fn fold_div(lhs: Value, rhs: Value) -> Result<Value, Located<ParseError>> {
+    match (lhs, rhs) {
+        (Value::IntLit(_), Value::IntLit(0)) => {
+            todo!("division by zero should return an error variant")
+        }
+        (Value::IntLit(a), Value::IntLit(b)) => Ok(Value::IntLit(a / b)),
+        _ => todo!("non-literal division"),
+    }
+}
+
+// Prefix forms
+fn fold_neg(rhs: Value) -> Result<Value, Located<ParseError>> {
+    match rhs {
+        Value::IntLit(v) => Ok(Value::IntLit(((v as i64).wrapping_neg()) as u64)),
+        _ => todo!("non-literal unary minus"),
+    }
+}
+
+fn fold_pos(rhs: Value) -> Result<Value, Located<ParseError>> {
+    match rhs {
+        Value::IntLit(v) => Ok(Value::IntLit(v)),
+        _ => todo!("non-literal unary plus"),
+    }
+}
+
+fn fold_deref(_rhs: Value) -> Result<Value, Located<ParseError>> {
+    todo!("pointer dereference not yet implemented")
+}
+
 
 use crate::input::FileId;
 
@@ -437,4 +555,69 @@ fn test_lexer(){
 
 	assert_eq!(toks.last().unwrap().value,Token::Num(1322));
 	assert_eq!(toks.len(),7);
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+    use crate::input::FileId;
+
+    fn parse_ok(text: &str) -> Value {
+        let src = Source::File(FileId(0));
+        let lexer = Lexer::new(text, src);
+        let mut parser = Parser::new_defualt(lexer);
+        parser.parse_exp().unwrap().unwrap()
+    }
+
+    #[test]
+    fn simple_addition() {
+        let v = parse_ok("1 + 2");
+        assert_eq!(v, Value::IntLit(3));
+    }
+
+    #[test]
+    fn operator_precedence() {
+        // * binds tighter than +
+        let v = parse_ok("1 + 2 * 3");
+        assert_eq!(v, Value::IntLit(7));
+
+        // same precedence left-associative
+        let v = parse_ok("1 + 2 + 3");
+        assert_eq!(v, Value::IntLit(6));
+
+        // / binds tighter than -
+        let v = parse_ok("10 - 6 / 2");
+        assert_eq!(v, Value::IntLit(7));
+    }
+
+    #[test]
+    fn parentheses_like_precedence() {
+        // force evaluation order: (1 + 2) * 3
+        // (we don’t have actual parentheses yet, but we can just test precedence reversal)
+        let v1 = parse_ok("1 + 2 * 3");
+        let v2 = parse_ok("1 * 2 + 3");
+        assert_eq!(v1, Value::IntLit(7)); // 1 + (2 * 3)
+        assert_eq!(v2, Value::IntLit(5)); // (1 * 2) + 3
+    }
+
+    #[test]
+    fn unary_operators() {
+        // -x should work as prefix
+        let v = parse_ok("-1 + 2");
+        assert_eq!(v, Value::IntLit(1));
+
+        // +x is no-op
+        let v = parse_ok("+1 + 2");
+        assert_eq!(v, Value::IntLit(3));
+
+        // double negation
+        let v = parse_ok("--5");
+        assert_eq!(v, Value::IntLit(5));
+    }
+
+    #[test]
+    #[should_panic] // hits the todo!() for division-by-zero handling
+    fn division_by_zero_panics_for_now() {
+        let _ = parse_ok("5 / 0");
+    }
 }

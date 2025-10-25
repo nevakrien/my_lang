@@ -461,7 +461,7 @@ second line
         let path: Arc<Path> = Arc::from(Path::new("test_input.txt"));
         let file = files.get_for_path(path.clone());
         let src_text = r#"
- 123x
+ 123x more stuff
 other_line
 "#;
         file.text.set(Ok(src_text.to_string())).unwrap();
