@@ -1,3 +1,5 @@
+use crate::parse::Location;
+use crate::parse::Loc;
 use crate::parse::Located;
 use std::fmt;
 use std::error::Error;
@@ -9,28 +11,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-#[repr(C)]
-#[derive(Clone,Copy,PartialEq,Debug,Hash)]
-pub struct Loc {
-    pub src:Source,
-    pub start:usize,
-    pub end:usize,//exclusive
-}
-
-impl Loc {
-    #[inline]
-    pub fn simple_combine(&self,other:&Loc)->Option<Loc>{
-        if self.src != other.src {
-            return None
-        }
-
-        Some(Loc{
-            src:self.src,
-            start:self.start.min(other.start),
-            end:self.end.max(other.end),
-        })
-    }
-}
 
 #[repr(C,u32)]
 #[derive(Clone,Copy,PartialEq,Eq,Debug,Hash)]
@@ -179,51 +159,6 @@ impl MacroArena {
     }
 }
 
-#[derive(Debug)]
-pub struct MappedError<'a, E: Error> {
-    pub inner: E,
-    pub line: LineNum,
-    pub line_text: &'a str,
-    pub col_start: usize,
-    pub col_end: usize,
-}
-
-impl<'a, E: Error> MappedError<'a, E> {
-    #[inline]
-    pub fn new(inner: E, map: &'a LineMap, text: &'a str, loc: Loc) -> Self {
-        let line = map.line_num(loc.start);
-        let line_text = map.line_text(line, text);
-
-
-        let start_of_line = map.line_start(line);
-        let end_of_line = map.line_end(line);
-
-        let col_start = loc.start - start_of_line;
-        let col_end = loc.end.min(end_of_line) - start_of_line;
-
-        Self { inner, line, line_text, col_start, col_end }
-    }
-}
-
-impl<'a, E: Error> fmt::Display for MappedError<'a, E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{}", self.inner)?;
-        writeln!(f, " --> line {}", self.line.0)?;
-        writeln!(f, "  | {}", self.line_text)?;
-        writeln!(
-            f,
-            "  | {}{}",
-            " ".repeat(self.col_start),
-            "^".repeat(self.col_end.saturating_sub(self.col_start).max(1))
-        )
-    }
-}
-
-impl<'a, E: Error + 'static> Error for MappedError<'a, E> {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.inner)
-    }
-}
 
 #[derive(Clone,Copy)]
 pub struct Context<'a>{
@@ -231,25 +166,117 @@ pub struct Context<'a>{
     pub macros:&'a MacroArena,
 }
 
+
+#[derive(Debug)]
+pub struct MappedError<'a, E: Error> {
+    pub inner: E,
+    pub spans: Vec<MappedSpan<'a>>,
+}
+
+#[derive(Debug)]
+pub struct MappedSpan<'a> {
+    pub src: Source,
+    pub line: LineNum,
+    pub line_text: &'a str,
+    pub col_start: usize,
+    pub col_end: usize,
+}
+
+impl<'a, E: Error> fmt::Display for MappedError<'a, E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{}", self.inner)?;
+        let mut last_src: Option<Source> = None;
+        for span in &self.spans {
+            if last_src != Some(span.src) {
+                writeln!(f, "\nIn {:?}:", span.src)?;
+                last_src = Some(span.src);
+            }
+
+            writeln!(f, " --> line {}", span.line.0)?;
+            writeln!(f, "  | {}", span.line_text)?;
+            writeln!(
+                f,
+                "  | {}{}",
+                " ".repeat(span.col_start),
+                "^".repeat(span.col_end.saturating_sub(span.col_start).max(1))
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl<'a, E: Error > Error for MappedError<'a, E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.inner.source()
+    }
+}
+
 impl<'a> Context<'a> {
-    pub fn get_text(&self,loc:Loc)->&'a str{
-        match loc.src {
-            Source::File(id) => {
-                let info = self.files.get(id).expect("file does not exist");
-                let text = info.text.get().unwrap().as_ref().unwrap();
-                &text[loc.start..loc.end]
-            },
-            Source::Macro(id) => {
-                let info = self.macros.get(id).expect("macro does not exist");
-                let text = &info.text;
-                &text[loc.start..loc.end]
-            }, 
+    pub fn add_context<E: Error>(&self, error: Located<E>) -> MappedError<'a, E> {
+        let spans = match &error.loc {
+            Location::Simple(loc) => vec![self.map_loc_to_span(*loc)],
+            Location::Many(locs) => {
+                // Group by source and render minimal per-file spans
+                locs.iter()
+                    .map(|loc| self.map_loc_to_span(*loc))
+                    .collect()
+            }
+        };
+
+        MappedError {
+            inner: error.value,
+            spans,
         }
     }
 
-    pub fn add_context<E:Error>(&self,error:Located<E>)->MappedError<'a, E>{
-        let (map,text) = self.get_line_map_and_full_text(error.loc);
-        MappedError::new(error.value,map,text,error.loc)
+    // fn normalize_location(&self, loc: &Location) -> Location {
+    //     match loc {
+    //         Location::Simple(l) => Location::Simple(*l),
+    //         Location::Many(locs) => {
+    //             let unique_sources: HashSet<_> = locs.iter().map(|l| l.src).collect();
+
+    //             // If all spans are from the same macro, expand to macro text
+    //             if unique_sources.len() == 1 {
+    //                 let src = *unique_sources.iter().next().unwrap();
+    //                 if let Source::Macro(_) = src {
+    //                     // keep macro context
+    //                     return loc.clone();
+    //                 }
+    //             }
+
+    //             // Otherwise (mixed or top-level file) — collapse to outermost file locs only
+    //             let outer: Vec<_> = locs
+    //                 .iter()
+    //                 .filter(|l| matches!(l.src, Source::File(_)))
+    //                 .cloned()
+    //                 .collect();
+
+    //             if outer.is_empty() {
+    //                 loc.clone() // fallback
+    //             } else {
+    //                 Location::Many(outer.into())
+    //             }
+    //         }
+    //     }
+    // }
+
+    fn map_loc_to_span(&self, loc: Loc) -> MappedSpan<'a> {
+        let (map, text) = self.get_line_map_and_full_text(loc);
+        let line = map.line_num(loc.start);
+        let line_text = map.line_text(line, text);
+        let start_of_line = map.line_start(line);
+        let end_of_line = map.line_end(line);
+
+        let col_start = loc.start - start_of_line;
+        let col_end = loc.end.min(end_of_line) - start_of_line;
+
+        MappedSpan {
+            src: loc.src,
+            line,
+            line_text,
+            col_start,
+            col_end,
+        }
     }
 
     pub fn get_line_map_and_full_text(&self,loc:Loc)->(&'a LineMap,&'a str){
@@ -266,6 +293,7 @@ impl<'a> Context<'a> {
 
     }
 }
+
 
 /// 1 indexed line number
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]
@@ -409,7 +437,8 @@ mod tests {
 }
 #[cfg(test)]
 mod mapped_error_format_tests {
-    use super::*;
+    use std::rc::Rc;
+use super::*;
     use crate::parse::BasicLexer;
     use crate::input::Source;
     use std::path::Path;
@@ -478,5 +507,67 @@ other_line
             }
             Ok(_) => panic!("expected WeirdNumberEnd"),
         }
+    }
+
+    #[test]
+    #[should_panic]
+    fn mapped_error_nested_macro_cross_file() {
+        let files = FileArena {
+            path_map: Mutex::new(HashMap::new()),
+            files: boxcar::Vec::new(),
+        };
+        let macros = MacroArena(boxcar::Vec::new());
+        let ctx = Context { files: &files, macros: &macros };
+
+        // --- outer file: contains the macro invocation ---
+        let path_a: Arc<Path> = Arc::from(Path::new("outer_file.txt"));
+        let file_a = files.get_for_path(path_a.clone());
+        let text_a = "a + macro!(b)\n";
+        file_a.text.set(Ok(text_a.to_string())).unwrap();
+
+        // find actual byte offsets for "macro!(b)"
+        let outer_start = text_a.find("macro!(").unwrap();
+        let outer_end = outer_start + "macro!(b)".len();
+        let src_outer = Loc {
+            src: Source::File(file_a.id),
+            start: outer_start,
+            end: outer_end,
+        };
+
+        // --- macro body text ---
+        let path_b: Arc<Path> = Arc::from(Path::new("inner_macro.txt"));
+        let file_b = files.get_for_path(path_b.clone());
+        let text_b = "b + 1.2.3\n";
+        file_b.text.set(Ok(text_b.to_string())).unwrap();
+
+        // add the macro definition
+        let macro_id = macros.add(src_outer, text_b.to_string());
+
+        // locate the malformed number inside the macro: "1.2.3"
+        let bad_start = text_b.find("1.2.3").unwrap();
+        let bad_end = bad_start + "1.2.3".len();
+        let loc_inner = Loc {
+            src: Source::Macro(macro_id),
+            start: bad_start,
+            end: bad_end,
+        };
+
+        // outer slice covering the macro call in the original file
+        let outer_loc = src_outer;
+
+        // combine both
+        let error_loc = Location::Many(Rc::from([outer_loc, loc_inner]));
+
+        #[derive(Debug, Error)]
+        #[error("demo numeric parse failure")]
+        struct FakeError;
+
+        let located_err = Located {
+            value: FakeError,
+            loc: error_loc,
+        };
+
+        let mapped = ctx.add_context(located_err);
+        panic!("{}", mapped);
     }
 }

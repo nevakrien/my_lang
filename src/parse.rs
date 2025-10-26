@@ -3,18 +3,54 @@ use thiserror::Error;
 use std::collections::HashMap;
 use std::rc::Rc;
 use crate::input::Source;
-use crate::input::Loc;
 use std::ops::{Deref, DerefMut};
 
-#[derive(Clone, Debug, PartialEq, Hash)]
+#[repr(C)]
+#[derive(Clone,Copy,PartialEq,Debug,Hash)]
+pub struct Loc {
+    pub src:Source,
+    pub start:usize,
+    pub end:usize,//exclusive
+}
+
+impl Loc {
+    #[inline]
+    pub fn simple_combine(self,other:&Loc)->Option<Loc>{
+        if self.src != other.src {
+            return None
+        }
+
+        Some(Loc{
+            src:self.src,
+            start:self.start.min(other.start),
+            end:self.end.max(other.end),
+        })
+    }
+
+    pub fn with<T>(self,value:T)->Located<T>{
+        Located{
+            value,
+            loc:Location::Simple(self)
+        }
+    }
+}
+
+#[derive(Clone,PartialEq,Debug)]
+pub enum Location {
+	Simple(Loc),
+	Many(Rc<[Loc]>)
+}
+
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Located<T> {
     pub value: T,
-    pub loc: Loc,
+    pub loc: Location,
 }
 
 impl<T> Located<T> {
     #[inline]
-    pub fn new(value: T, loc: Loc) -> Self {
+    pub fn new(value: T, loc: Location) -> Self {
         Self { value, loc }
     }
 
@@ -32,7 +68,7 @@ impl<T> Located<T> {
     pub fn with<U>(&self,value:U)->Located<U>{
     	Located{
     		value,
-    		loc:self.loc
+    		loc:self.loc.clone()
     	}
     }
 
@@ -146,7 +182,7 @@ impl<'a> BasicLexer<'a>{
 			end,
 		};
 
-		let ans = Located::new(value,loc);
+		let ans = Located::new(value,Location::Simple(loc));
 
 		if end-self.cur_start < self.cur_str.len(){
 			self.cur_str=&self.cur_str[size..];
@@ -325,15 +361,22 @@ impl<'a> BasicLexer<'a>{
 
 
 
-pub type Bp = u32;
+pub type Bp = i32;
 
 #[derive(Debug)]
-pub enum ParseError {
-	LexError(LexError),
+pub enum ParseError<'a> {
+    Lex(LexError),
+    UnknownName(&'a str),
+    MissingPrefix(&'a str),
+    // MissingPostfix(&'a str),
+    ExpectedOperand,
 }
 
-impl From<LexError> for ParseError{
-fn from(e: LexError) -> Self {Self::LexError(e)}
+pub type ParseRes<'a, T = Value> = Result<T, Located<ParseError<'a>>>;
+pub type ParseOpRes<'a, T = Value> = ParseRes<'a, Option<T>>;
+
+impl From<LexError> for ParseError<'_>{
+fn from(e: LexError) -> Self {Self::Lex(e)}
 }
 
 #[derive(Debug, PartialEq)]
@@ -342,8 +385,7 @@ pub enum Value {
 	IntLit(u64),
 }
 
-pub type ParseOpRes<T=Value> = Result<Option<T>,Located<ParseError>>;
-pub type ParseRes<T=Value> = Result<T,Located<ParseError>>;
+
 
 #[derive(Debug,Default)]
 pub struct Lexer<'a>{
@@ -362,7 +404,7 @@ impl<'a> Lexer<'a> {
 		ans
 	}
 
-	pub fn peek(&mut self)->ParseOpRes<&Located<Token<'a>>>{
+	pub fn peek(&mut self)->ParseOpRes<'a,&Located<Token<'a>>>{
 		if self.saved_peek.is_none() {
 			self.saved_peek = self.next()?;
 		}
@@ -370,7 +412,7 @@ impl<'a> Lexer<'a> {
 		Ok(self.saved_peek.as_ref())
 	}
 
-	pub fn next(&mut self)->ParseOpRes<Located<Token<'a>>>{
+	pub fn next(&mut self)->ParseOpRes<'a,Located<Token<'a>>>{
 		if self.saved_peek.is_some(){
 			return Ok(self.saved_peek.take());
 		}
@@ -388,14 +430,40 @@ impl<'a> Lexer<'a> {
 }
 
 
-pub trait ParseElm {
-	 fn parse_pre(&self,parser:&mut Parser,min_bp:Bp)->ParseOpRes;
-	 fn parse_post(&self,parser:&mut Parser,min_bp:Bp,lhs:Value)->ParseRes;
-	 fn postfix_bp(&self)->Option<Bp>;
+
+// pub trait ParseElm {
+// 	 fn parse_pre(&self,parser:&mut Parser)->ParseOpRes;
+// 	 fn parse_post(&self,parser:&mut Parser,lhs:Value)->ParseRes;
+// 	 fn postfix_bp(&self)->Option<Bp>;
+// }
+
+pub trait PrefixParse {
+	fn parse<'a>(&self,parser:&mut Parser<'a>)->ParseRes<'a>;
+	fn bp(&self)->Bp;
+}
+
+pub trait InfixOp {
+	fn combine(&self,lhs:Value,rhs:Value)->ParseRes<'static>;
+	fn bp(&self)->Bp;
+}
+
+pub trait PostfixOp {
+	fn combine<'a>(&self,lhs:Value,parser:&mut Parser<'a>)->ParseRes<'a>;
+	fn bp(&self)->Bp;
 }
 
 
-type KnowenName = Rc<dyn ParseElm>;
+pub enum PostParse {
+	Infix(Box<dyn InfixOp>),
+	Postfix(Box<dyn PostfixOp>),
+}
+
+pub struct ParseOptions {
+	pub pre:Option<Box<dyn PrefixParse>>,
+	pub post:Option<PostParse>,
+}
+
+type KnowenName = Rc<ParseOptions>;
 
 
 pub struct Parser<'a> {
@@ -403,165 +471,93 @@ pub struct Parser<'a> {
 	names:HashMap<&'a str,KnowenName>,
 }
 
-macro_rules! binop {
-    ($name:expr, $lbp:expr, $rbp:expr, $infix:expr, $prefix:expr) => {
-        Rc::new(BinOp {
-            name: $name,
-            left_bp: $lbp,
-            right_bp: $rbp,
-            fold_infix: $infix,
-            fold_prefix: $prefix,
-        }) as Rc<dyn ParseElm>
-    };
-}
-
 
 impl<'a> Parser<'a>{
 	 pub fn new_defualt(lexer: Lexer<'a>) -> Self {
         let mut names = HashMap::new();
 
-        names.insert("+", binop!("+", 10, 11, fold_add, Some(fold_pos)));
-        names.insert("-", binop!("-", 10, 11, fold_sub, Some(fold_neg)));
-        names.insert("*", binop!("*", 20, 21, fold_mul, Some(fold_deref)));
-        names.insert("/", binop!("/", 20, 21, fold_div, None));
+        
 
         Self { lexer, names }
     }
 
-	fn exp_parser(&self,name:&str)->ParseRes<KnowenName>{
-		self.names.get(name).ok_or_else(||{todo!()}).cloned()
-	}
+
+
 	#[inline(always)]
-	pub fn parse_exp(&mut self)->ParseOpRes{
-		self.expr_bp(0)
+	pub fn parse_exp(&mut self)->ParseOpRes<'a>{
+		self.expr_bp(Bp::MIN)
 	}
-	pub fn expr_bp(&mut self,min_bp:Bp)->ParseOpRes{
-	    let Some(tok) =  self.lexer.next()? else{
-	        return Ok(None)
+	pub fn expr_bp(&mut self, min_bp: Bp) -> ParseOpRes<'a> {
+	    let Some(tok) = self.lexer.next()? else {
+	        return Ok(None);
 	    };
 
-	    let mut lhs :Value = match tok.value {
-	        Token::Str(s)=>Value::StringLit(s),
-	        Token::Num(i)=>Value::IntLit(i),
-	        Token::Name(n)=> {
-	        	let parser = self.exp_parser(n)?;
-	        	match parser.parse_pre(self,min_bp)?{
-	        		None=>return Ok(None),
-	        		Some(x)=>x,
-	        	}
-	        },
+	    // --- prefix / atom phase ---
+	    let mut lhs: Value = match tok.value {
+	        Token::Str(s) => Value::StringLit(s),
+	        Token::Num(i) => Value::IntLit(i),
+	        Token::Name(n) => {
+	            let name = tok.with(n); // Located<&str>
+
+	            // Lookup in operator table
+	            let Some(opts) = self.names.get(name.value) else {
+	                return Err(name.with(ParseError::UnknownName(name.value)));
+	            };
+
+	            // We have a known name, but check if it’s a prefix op
+	            match opts.clone().pre.as_ref() {
+	                Some(pre) => pre.parse(self)?,
+	                None => return Err(name.with(ParseError::MissingPrefix(name.value))),
+	            }
+	        }
 	    };
 
+	    // --- postfix / infix loop ---
 	    loop {
-	        let maybe_op = match self.lexer.peek()?.map(|v|&v.value) {
-	            None => break,
-	            Some(&Token::Name(n)) => {
-	            	self.exp_parser(n)?
-	            },
-	            Some(_t) => todo!(),//panic!("bad token: {:?}", t),
+	        let Some(peek_tok) = self.lexer.peek()? else {
+	            break;
 	        };
 
-	        let Some(l_bp) = maybe_op.postfix_bp() else {
-	        	break;
+	        let name = match &peek_tok.value {
+	            Token::Name(n) => peek_tok.with(*n),
+	            _ => break, // not an operator
 	        };
+
+	        let Some(opts) = self.names.get(name.value) else {
+	            break; // unknown name -> not an operator
+	        };
+
+	        let opts = opts.clone();
+
+	        let Some(post) = &opts.post else {
+	            break; // no postfix/infix handler
+	        };
+
+	        let l_bp = match post {
+	            PostParse::Postfix(op) => op.bp(),
+	            PostParse::Infix(op) => op.bp(),
+	        };
+
 	        if l_bp < min_bp {
 	            break;
 	        }
 
-	        self.lexer.next()?;
-	        lhs = maybe_op.clone().parse_post(self,min_bp,lhs)?;
+	        let op_tok = self.lexer.next()?.unwrap(); // consume operator token
+
+	        lhs = match post {
+	            PostParse::Postfix(op) => op.combine(lhs, self)?,
+	            PostParse::Infix(op) => {
+	                let rhs = self
+	                    .expr_bp(l_bp)?
+	                    .ok_or(op_tok.with(ParseError::ExpectedOperand))?;
+	                op.combine(lhs, rhs)?
+	            }
+	        };
 	    }
 
 	    Ok(Some(lhs))
 	}
-}
 
-#[derive(Clone,Copy)]
-pub struct BinOp {
-    pub name: &'static str,
-    pub left_bp: Bp,
-    pub right_bp: Bp,
-    pub fold_infix: fn(Value, Value) -> Result<Value, Located<ParseError>>,
-    pub fold_prefix: Option<fn(Value) -> Result<Value, Located<ParseError>>>,
-}
-
-impl ParseElm for BinOp {
-    fn postfix_bp(&self) -> Option<Bp> {
-        Some(self.left_bp)
-    }
-
-    fn parse_pre(&self, parser: &mut Parser, _min_bp: Bp) -> ParseOpRes {
-        // If this operator *can* be used as a prefix, handle it
-        if let Some(prefix_fn) = self.fold_prefix {
-            let rhs = parser.expr_bp(self.right_bp)?;
-            if let Some(rhs_val) = rhs {
-                return prefix_fn(rhs_val).map(Some);
-            } else {
-                return Ok(None);
-            }
-        }
-
-        // Otherwise it's not valid in prefix position
-        Err(parser.lexer.next()?.unwrap().with(todo!()))
-    }
-
-    fn parse_post(&self, parser: &mut Parser, _min_bp: Bp, lhs: Value) -> ParseRes {
-        let Some(rhs_val) = parser.expr_bp(self.right_bp)? else{
-        	todo!()
-        };
-        
-        (self.fold_infix)(lhs, rhs_val)
-    }
-}
-
-fn fold_add(lhs: Value, rhs: Value) -> Result<Value, Located<ParseError>> {
-    match (lhs, rhs) {
-        (Value::IntLit(a), Value::IntLit(b)) => Ok(Value::IntLit(a + b)),
-        _ => todo!("non-literal addition (build AST node here)"),
-    }
-}
-
-fn fold_sub(lhs: Value, rhs: Value) -> Result<Value, Located<ParseError>> {
-    match (lhs, rhs) {
-        (Value::IntLit(a), Value::IntLit(b)) => Ok(Value::IntLit(a - b)),
-        _ => todo!("non-literal subtraction"),
-    }
-}
-
-fn fold_mul(lhs: Value, rhs: Value) -> Result<Value, Located<ParseError>> {
-    match (lhs, rhs) {
-        (Value::IntLit(a), Value::IntLit(b)) => Ok(Value::IntLit(a * b)),
-        _ => todo!("non-literal multiplication"),
-    }
-}
-
-fn fold_div(lhs: Value, rhs: Value) -> Result<Value, Located<ParseError>> {
-    match (lhs, rhs) {
-        (Value::IntLit(_), Value::IntLit(0)) => {
-            todo!("division by zero should return an error variant")
-        }
-        (Value::IntLit(a), Value::IntLit(b)) => Ok(Value::IntLit(a / b)),
-        _ => todo!("non-literal division"),
-    }
-}
-
-// Prefix forms
-fn fold_neg(rhs: Value) -> Result<Value, Located<ParseError>> {
-    match rhs {
-        Value::IntLit(v) => Ok(Value::IntLit(((v as i64).wrapping_neg()) as u64)),
-        _ => todo!("non-literal unary minus"),
-    }
-}
-
-fn fold_pos(rhs: Value) -> Result<Value, Located<ParseError>> {
-    match rhs {
-        Value::IntLit(v) => Ok(Value::IntLit(v)),
-        _ => todo!("non-literal unary plus"),
-    }
-}
-
-fn fold_deref(_rhs: Value) -> Result<Value, Located<ParseError>> {
-    todo!("pointer dereference not yet implemented")
 }
 
 
@@ -583,67 +579,3 @@ fn test_lexer(){
 	assert_eq!(toks.len(),7);
 }
 
-#[cfg(test)]
-mod parse_tests {
-    use super::*;
-    use crate::input::FileId;
-
-    fn parse_ok(text: &str) -> Value {
-        let src = Source::File(FileId(0));
-        let lexer = Lexer::new(text, src);
-        let mut parser = Parser::new_defualt(lexer);
-        parser.parse_exp().unwrap().unwrap()
-    }
-
-    #[test]
-    fn simple_addition() {
-        let v = parse_ok("1 + 2");
-        assert_eq!(v, Value::IntLit(3));
-    }
-
-    #[test]
-    fn operator_precedence() {
-        // * binds tighter than +
-        let v = parse_ok("1 + 2 * 3");
-        assert_eq!(v, Value::IntLit(7));
-
-        // same precedence left-associative
-        let v = parse_ok("1 + 2 + 3");
-        assert_eq!(v, Value::IntLit(6));
-
-        // / binds tighter than -
-        let v = parse_ok("10 - 6 / 2");
-        assert_eq!(v, Value::IntLit(7));
-    }
-
-    #[test]
-    fn parentheses_like_precedence() {
-        // force evaluation order: (1 + 2) * 3
-        // (we don’t have actual parentheses yet, but we can just test precedence reversal)
-        let v1 = parse_ok("1+2 * 3");
-        let v2 = parse_ok("1 * 2 + 3");
-        assert_eq!(v1, Value::IntLit(7)); // 1 + (2 * 3)
-        assert_eq!(v2, Value::IntLit(5)); // (1 * 2) + 3
-    }
-
-    #[test]
-    fn unary_operators() {
-        // -x should work as prefix
-        let v = parse_ok("-1 + 2");
-        assert_eq!(v, Value::IntLit(1));
-
-        // +x is no-op
-        let v = parse_ok("+1 + 2");
-        assert_eq!(v, Value::IntLit(3));
-
-        // double negation
-        let v = parse_ok("--5");
-        assert_eq!(v, Value::IntLit(5));
-    }
-
-    #[test]
-    #[should_panic] // hits the todo!() for division-by-zero handling
-    fn division_by_zero_panics_for_now() {
-        let _ = parse_ok("5 / 0");
-    }
-}
