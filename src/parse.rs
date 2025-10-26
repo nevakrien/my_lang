@@ -176,15 +176,18 @@ impl<'a> BasicLexer<'a>{
 			if c.is_whitespace() {
 				break;
 			}
-			size+=c.len_utf8();
-
 
 			if !(c.is_numeric() || c=='_') {
+				if !c.is_alphabetic(){
+					break;//we explictly allow 2+3 style parses
+				}
+				size+=c.len_utf8();
 				let tok = self.yeild_next(size);
 				let err = tok.map_owned(|_|{LexError::WeirdNumberEnd(c)});
 				return Err(err);
 			}
 
+			size+=c.len_utf8();
 		}
 
 		let tok = self.yeild_next(size);
@@ -254,25 +257,48 @@ impl<'a> BasicLexer<'a>{
 		Err(self.yeild_next(size).with(LexError::MissingStringClose))
 	}
 
+	// fn parse_operator(&mut self) -> Located<Token<'a>> {
+	//     // Some ASCII multi-char operators need to be special-cased
+	//     let size = match self.cur_str.as_bytes().get(..2) {
+	//         Some(b"==") | Some(b"!=") |
+	//         Some(b"<=") | Some(b">=") |
+	//         Some(b"->") | Some(b"=>") |
+	//         Some(b"&&") | Some(b"||") |
+	//         Some(b"<<") | Some(b">>") |
+	//         Some(b"+=") | Some(b"-=") |
+	//         Some(b"*=") | Some(b"/=") |
+	//         Some(b"%=") | Some(b"&=") |
+	//         Some(b"|=") | Some(b"^=") |
+	//         Some(b"::") | Some(b"|>") |
+	//         Some(b"++") | Some(b"--") => 2,
+
+	//         _ => self.cur_str.chars().next().unwrap().len_utf8(),
+	//     };
+
+	//     self.yeild_next(size).map_owned(Token::Name)
+	// }
 	fn parse_operator(&mut self) -> Located<Token<'a>> {
-	    // Some ASCII multi-char operators need to be special-cased
-	    let size = match self.cur_str.as_bytes().get(..2) {
-	        Some(b"==") | Some(b"!=") |
-	        Some(b"<=") | Some(b">=") |
-	        Some(b"->") | Some(b"=>") |
-	        Some(b"&&") | Some(b"||") |
-	        Some(b"<<") | Some(b">>") |
-	        Some(b"+=") | Some(b"-=") |
-	        Some(b"*=") | Some(b"/=") |
-	        Some(b"%=") | Some(b"&=") |
-	        Some(b"|=") | Some(b"^=") |
-	        Some(b"::") |
-	        Some(b"++") | Some(b"--") => 2,
+	    
+	    match self.cur_str.as_bytes().get(1).unwrap(){
+	    	b'?'|b'!'|b'.'|
+	    	b'*'|b';'|b'\''|
+	    	b'('|b')'|b'['|b']'|b'{'|b'}'
+	    	=>{
+	    		return self.yeild_next(1).map_owned(Token::Name);
+	    	}
+	    	_=>{}
+	    }
 
-	        _ => self.cur_str.chars().next().unwrap().len_utf8(),
-	    };
+	    let mut size = 0usize;
+		for c in self.cur_str.chars(){
+			if c.is_alphanumeric() || c=='_' || c.is_whitespace() {
+				break;
+			}
 
-	    self.yeild_next(size).map_owned(Token::Name)
+			size+=c.len_utf8();
+		}
+
+		self.yeild_next(size).map_owned(Token::Name)
 	}
 
 
@@ -594,7 +620,7 @@ mod parse_tests {
     fn parentheses_like_precedence() {
         // force evaluation order: (1 + 2) * 3
         // (we don’t have actual parentheses yet, but we can just test precedence reversal)
-        let v1 = parse_ok("1 + 2 * 3");
+        let v1 = parse_ok("1+2 * 3");
         let v2 = parse_ok("1 * 2 + 3");
         assert_eq!(v1, Value::IntLit(7)); // 1 + (2 * 3)
         assert_eq!(v2, Value::IntLit(5)); // (1 * 2) + 3
