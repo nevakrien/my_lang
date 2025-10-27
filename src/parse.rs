@@ -1,7 +1,11 @@
 
+use crate::cffi::StrRC;
+use crate::cffi::RC;
+use crate::cffi::SliceRC;
+use std::hash::Hash;
 use thiserror::Error;
 use std::collections::HashMap;
-use std::rc::Rc;
+// use std::rc::Rc;
 use crate::input::Source;
 use std::ops::{Deref, DerefMut};
 
@@ -35,13 +39,24 @@ impl Loc {
     }
 }
 
+
+#[repr(C,u32)]
 #[derive(Clone,PartialEq,Debug)]
 pub enum Location {
 	Simple(Loc),
-	Many(Rc<[Loc]>)
+	Many(SliceRC<Loc>)
 }
 
+impl Location {
+	pub fn with<T>(self,value:T)->Located<T>{
+        Located{
+            value,
+            loc:self
+        }
+    }
+}
 
+#[repr(C)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Located<T> {
     pub value: T,
@@ -372,18 +387,30 @@ pub enum ParseError<'a> {
     ExpectedOperand,
 }
 
-pub type ParseRes<'a, T = Value> = Result<T, Located<ParseError<'a>>>;
-pub type ParseOpRes<'a, T = Value> = ParseRes<'a, Option<T>>;
+pub type ParseRes<'a, T = LAst> = Result<T, Located<ParseError<'a>>>;
+pub type ParseOpRes<'a, T = LAst> = ParseRes<'a, Option<T>>;
 
 impl From<LexError> for ParseError<'_>{
 fn from(e: LexError) -> Self {Self::Lex(e)}
 }
 
+
+#[repr(C,u32)]
 #[derive(Debug, PartialEq)]
-pub enum Value {
-	StringLit(String),
+pub enum Ast{
+	Op(RC<LAst>,SliceRC<LAst>),
+	StringLit(StrRC),
 	IntLit(u64),
+	SignedInt(i64),
 }
+
+pub type LAst = Located<Ast>;
+
+// #[derive(Debug, PartialEq)]
+// pub enum Value {
+// 	StringLit(String),
+// 	IntLit(u64),
+// }
 
 
 
@@ -443,12 +470,12 @@ pub trait PrefixParse {
 }
 
 pub trait InfixOp {
-	fn combine(&self,lhs:Value,rhs:Value)->ParseRes<'static>;
+	fn combine(&self,lhs:LAst,rhs:LAst)->ParseRes<'static>;
 	fn bp(&self)->Bp;
 }
 
 pub trait PostfixOp {
-	fn combine<'a>(&self,lhs:Value,parser:&mut Parser<'a>)->ParseRes<'a>;
+	fn combine<'a>(&self,lhs:LAst,parser:&mut Parser<'a>)->ParseRes<'a>;
 	fn bp(&self)->Bp;
 }
 
@@ -463,7 +490,7 @@ pub struct ParseOptions {
 	pub post:Option<PostParse>,
 }
 
-type KnowenName = Rc<ParseOptions>;
+type KnowenName = RC<ParseOptions>;
 
 
 pub struct Parser<'a> {
@@ -493,9 +520,9 @@ impl<'a> Parser<'a>{
 	    };
 
 	    // --- prefix / atom phase ---
-	    let mut lhs: Value = match tok.value {
-	        Token::Str(s) => Value::StringLit(s),
-	        Token::Num(i) => Value::IntLit(i),
+	    let mut lhs: LAst = match tok.value {
+	        Token::Str(s) => tok.loc.with(Ast::StringLit(s.into())),
+	        Token::Num(i) => tok.loc.with(Ast::IntLit(i)),
 	        Token::Name(n) => {
 	            let name = tok.with(n); // Located<&str>
 
