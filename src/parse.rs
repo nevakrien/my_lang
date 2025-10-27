@@ -1,3 +1,4 @@
+use crate::input::SourceContext;
 use crate::types::VarID;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -33,38 +34,22 @@ impl Loc {
     pub fn with<T>(self,value:T)->Located<T>{
         Located{
             value,
-            loc:Location::Simple(self)
-        }
-    }
-}
-
-
-#[repr(C,u32)]
-#[derive(Clone,PartialEq,Debug)]
-pub enum Location {
-	Simple(Loc),
-	Many(Rc<[Loc]>)
-}
-
-impl Location {
-	pub fn with<T>(self,value:T)->Located<T>{
-        Located{
-            value,
             loc:self
         }
     }
 }
 
+
 #[repr(C)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Located<T> {
     pub value: T,
-    pub loc: Location,
+    pub loc: Loc,
 }
 
 impl<T> Located<T> {
     #[inline]
-    pub fn new(value: T, loc: Location) -> Self {
+    pub fn new(value: T, loc: Loc) -> Self {
         Self { value, loc }
     }
 
@@ -196,7 +181,7 @@ impl<'a> BasicLexer<'a>{
 			end,
 		};
 
-		let ans = Located::new(value,Location::Simple(loc));
+		let ans = Located::new(value,loc);
 
 		if end-self.cur_start < self.cur_str.len(){
 			self.cur_str=&self.cur_str[size..];
@@ -516,20 +501,21 @@ impl<K:Hash+Eq, V> Scope<'_, K, V>{
 
 pub struct Parser<'me,'a> {
 	pub lexer:Lexer<'a>,
-	names:Scope<'me,&'a str,KnowenName>,
+	pub names:Scope<'me,&'a str,KnowenName>,
+	pub ctx:&'a SourceContext,
 }
 
 
 impl<'me,'a> Parser<'me,'a>{
-	 pub fn new_defualt(lexer: Lexer<'a>) -> Self {
-        let mut owned = HashMap::new();
+	 pub fn new_defualt(lexer: Lexer<'a>,ctx:&'a SourceContext) -> Self {
+        let owned = HashMap::new();
         let names = Scope{
         	owned,
         	parent:None
         };
         
 
-        Self { lexer, names }
+        Self { lexer, names,ctx }
     }
 
 

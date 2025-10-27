@@ -1,4 +1,3 @@
-use crate::parse::Location;
 use crate::parse::Loc;
 use crate::parse::Located;
 use std::fmt;
@@ -77,13 +76,38 @@ impl FileInfo {
     }
 }
 
-pub struct FileArena{
-    path_map:Mutex<HashMap<Arc<Path>,usize>>,
-    pub files:boxcar::Vec<FileInfo>
+
+
+
+pub struct MacroCall {
+    pub depth:usize,
+
+    pub id:MacroId,
+    pub src:Loc,
+    pub text:String,//not sure yet if tokens or not
+    pub line_map:OnceCell<LineMap>,
 }
 
-impl FileArena {
-    pub fn get(&self,id:FileId)->Option<&FileInfo>{
+impl MacroCall{
+    pub fn get_line_map(&self)->&LineMap{
+        self.line_map.get_or_init(||{LineMap::new(&self.text)})
+    }
+}
+
+
+#[derive(Default)]
+pub struct SourceContext{
+    path_map:Mutex<HashMap<Arc<Path>,usize>>,
+    pub files:boxcar::Vec<FileInfo>,
+    pub macros:boxcar::Vec<MacroCall>,
+}
+
+
+impl SourceContext {
+    pub fn new()->Self{
+        Self::default()
+    }
+    pub fn get_file(&self,id:FileId)->Option<&FileInfo>{
         self.files.get(id.0 as usize)
     }
     pub fn load_file(&self,path:Arc<Path>)->&FileInfo{
@@ -121,28 +145,20 @@ impl FileArena {
         std::mem::drop(map);
         self.files.get(file_id).unwrap()
     }
-}
 
-pub struct MacroCall {
-    pub id:MacroId,
-    pub src:Loc,
-    pub text:String,//not sure yet if tokens or not
-    pub line_map:OnceCell<LineMap>,
-}
-
-impl MacroCall{
-    pub fn get_line_map(&self)->&LineMap{
-        self.line_map.get_or_init(||{LineMap::new(&self.text)})
+    pub fn get_depth(&self,loc:Loc)->usize{
+        match loc.src {
+            Source::File(_) => 0,
+            Source::Macro(id) => self.macros[id.0 as usize].depth,
+        }
     }
-}
 
-
-pub struct MacroArena(boxcar::Vec<MacroCall>);
-
-impl MacroArena {
-    pub fn add(&self,src:Loc,text:String)->MacroId {
-        let id = self.0.push_with(|id|{
+    pub fn add_macro(&self,src:Loc,text:String)->MacroId {
+        let depth = self.get_depth(src);
+        let id = self.macros.push_with(|id|{
             MacroCall{
+                depth,
+
                 id:MacroId(id as u32),
                 src,
                 text,
@@ -154,17 +170,11 @@ impl MacroArena {
     }
 
 
-    pub fn get(&self,id:MacroId)->Option<&MacroCall>{
-        self.0.get(id.0 as usize)
+    pub fn get_macro(&self,id:MacroId)->Option<&MacroCall>{
+        self.macros.get(id.0 as usize)
     }
 }
 
-
-#[derive(Clone,Copy)]
-pub struct Context<'a>{
-    pub files:&'a FileArena,
-    pub macros:&'a MacroArena,
-}
 
 
 #[derive(Debug)]
@@ -211,17 +221,17 @@ impl<'a, E: Error > Error for MappedError<'a, E> {
     }
 }
 
-impl<'a> Context<'a> {
-    pub fn add_context<E: Error>(&self, error: Located<E>) -> MappedError<'a, E> {
-        let spans = match &error.loc {
-            Location::Simple(loc) => vec![self.map_loc_to_span(*loc)],
-            Location::Many(locs) => {
-                // Group by source and render minimal per-file spans
-                locs.iter()
-                    .map(|loc| self.map_loc_to_span(*loc))
-                    .collect()
-            }
-        };
+impl<'a> SourceContext {
+    pub fn add_context<E: Error>(&'a self, error: Located<E>) -> MappedError<'a, E> {
+        let mut loc = error.loc;
+        let mut spans = Vec::with_capacity(1);
+
+        while let Source::Macro(id) = loc.src {
+           spans.push(self.map_loc_to_span(loc));
+           loc = self.get_macro(id).expect("macro does not exist").src; 
+        }
+
+        spans.push(self.map_loc_to_span(loc));
 
         MappedError {
             inner: error.value,
@@ -229,38 +239,79 @@ impl<'a> Context<'a> {
         }
     }
 
-    // fn normalize_location(&self, loc: &Location) -> Location {
-    //     match loc {
-    //         Location::Simple(l) => Location::Simple(*l),
-    //         Location::Many(locs) => {
-    //             let unique_sources: HashSet<_> = locs.iter().map(|l| l.src).collect();
+    #[inline]
+    pub fn combine_locs(&'a self,a:Loc,b:Loc)->Option<Loc>{
+        if let Some(ans) = a.simple_combine(&b){
+            return Some(ans)
+        }
+        self.combine_locs_slow(a,b)
+    }
 
-    //             // If all spans are from the same macro, expand to macro text
-    //             if unique_sources.len() == 1 {
-    //                 let src = *unique_sources.iter().next().unwrap();
-    //                 if let Source::Macro(_) = src {
-    //                     // keep macro context
-    //                     return loc.clone();
-    //                 }
-    //             }
+    pub fn combine_locs_slow(&'a self,mut a:Loc,mut b:Loc)->Option<Loc>{
+        loop {
+            match(a.src,b.src){
+                (Source::File(_),Source::File(_))=>return a.simple_combine(&b),
 
-    //             // Otherwise (mixed or top-level file) — collapse to outermost file locs only
-    //             let outer: Vec<_> = locs
-    //                 .iter()
-    //                 .filter(|l| matches!(l.src, Source::File(_)))
-    //                 .cloned()
-    //                 .collect();
+                (Source::File(_), Source::Macro(m)) => {
+                    b = self.get_macro(m)?.src;
+                },
+                (Source::Macro(m), Source::File(_)) => {
+                    a = self.get_macro(m)?.src;
+                },
 
-    //             if outer.is_empty() {
-    //                 loc.clone() // fallback
-    //             } else {
-    //                 Location::Many(outer.into())
-    //             }
-    //         }
-    //     }
-    // }
+                (Source::Macro(aid),Source::Macro(bid))=>{
+                    let mut macro_a = self.get_macro(aid)?;
+                    let mut macro_b = self.get_macro(bid)?;
 
-    fn map_loc_to_span(&self, loc: Loc) -> MappedSpan<'a> {
+                    //1. normalize heigt so both are on same depth
+                    while macro_a.depth<macro_b.depth{
+                        a = macro_a.src;
+                        let Source::Macro(id) = a.src else{
+                            panic!("bad depth numbers");
+                        };
+                        macro_a = self.get_macro(id)?;
+                    }
+
+                    while macro_b.depth<macro_a.depth{
+                        b = macro_b.src;
+                        let Source::Macro(id) = b.src else{
+                            panic!("bad depth numbers");
+                        };
+                        macro_b = self.get_macro(id)?;
+                    }
+
+                    //2. bubele up untill both are in the same scope
+                    loop {
+                        if let Some(ans) = a.simple_combine(&b){
+                            return Some(ans)
+                        }
+
+                        match a.src{
+                            Source::Macro(id)=>{
+                                a = self.get_macro(id)?.src;
+                            },
+                            Source::File(_)=>{
+                                break;
+                            }
+                        };
+
+                        match b.src{
+                            Source::Macro(id)=>{
+                                b = self.get_macro(id)?.src;
+                            },
+                            Source::File(_)=>{
+                                break;
+                            }
+                        }
+                    }
+                },
+
+            }
+        }
+
+    }
+
+    fn map_loc_to_span(&'a self, loc: Loc) -> MappedSpan<'a> {
         let (map, text) = self.get_line_map_and_full_text(loc);
         let line = map.line_num(loc.start);
         let line_text = map.line_text(line, text);
@@ -279,14 +330,14 @@ impl<'a> Context<'a> {
         }
     }
 
-    pub fn get_line_map_and_full_text(&self,loc:Loc)->(&'a LineMap,&'a str){
+    pub fn get_line_map_and_full_text(&'a self,loc:Loc)->(&'a LineMap,&'a str){
         match loc.src {
             Source::File(id) => {
-                let info = self.files.get(id).expect("file does not exist");
+                let info = self.get_file(id).expect("file does not exist");
                 (info.get_line_map(),info.text.get().unwrap().as_ref().unwrap())
             },
             Source::Macro(id) => {
-                let info = self.macros.get(id).expect("macro does not exist");
+                let info = self.get_macro(id).expect("macro does not exist");
                 (info.get_line_map(),info.text.as_ref())
             }, 
         }
@@ -444,18 +495,14 @@ use super::*;
     use std::sync::Arc;
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "missing closing quote in string")]
     fn mapped_error_missing_quote() {
         // 1️⃣ Prepare arenas
-        let files = FileArena {
-            path_map: Mutex::new(HashMap::new()),
-            files: boxcar::Vec::new(),
-        };
-        let macros = MacroArena(boxcar::Vec::new());
+        let ctx = SourceContext::new();
 
         // 2️⃣ Add the *real* source text to the arena
         let path: Arc<Path> = Arc::from(Path::new("test_input.txt"));
-        let file = files.get_for_path(path.clone());
+        let file = ctx.get_for_path(path.clone());
         let src_text = r#"
 "unterminated
 second line
@@ -463,7 +510,6 @@ second line
         file.text.set(Ok(src_text.to_string())).unwrap();
 
         // 3️⃣ Create the lexer using that *same* text slice
-        let ctx = Context { files: &files, macros: &macros };
         let src = Source::File(file.id);
         let mut lex = BasicLexer::new(src_text, src);
 
@@ -478,23 +524,18 @@ second line
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "invalid number ending with")]
     fn mapped_error_weird_number_end() {
-        let files = FileArena {
-            path_map: Mutex::new(HashMap::new()),
-            files: boxcar::Vec::new(),
-        };
-        let macros = MacroArena(boxcar::Vec::new());
+        let ctx = SourceContext::new();
 
         let path: Arc<Path> = Arc::from(Path::new("test_input.txt"));
-        let file = files.get_for_path(path.clone());
+        let file = ctx.get_for_path(path.clone());
         let src_text = r#"
  123x more stuff
 other_line
 "#;
         file.text.set(Ok(src_text.to_string())).unwrap();
 
-        let ctx = Context { files: &files, macros: &macros };
         let src = Source::File(file.id);
         let mut lex = BasicLexer::new(src_text, src);
 
@@ -509,41 +550,32 @@ other_line
     }
 
     #[test]
-    #[should_panic]
-    fn mapped_error_nested_macro_cross_file() {
-        let files = FileArena {
-            path_map: Mutex::new(HashMap::new()),
-            files: boxcar::Vec::new(),
-        };
-        let macros = MacroArena(boxcar::Vec::new());
-        let ctx = Context { files: &files, macros: &macros };
+    #[should_panic(expected = "demo numeric parse failure")]
+    fn mapped_error_nested_macro_print() {
+        let ctx = SourceContext::new();
 
-        // --- outer file: contains the macro invocation ---
-        let path_a: Arc<Path> = Arc::from(Path::new("outer_file.txt"));
-        let file_a = files.get_for_path(path_a.clone());
-        let text_a = "a + macro!(b)\n";
-        file_a.text.set(Ok(text_a.to_string())).unwrap();
+        // --- outer file: defines and invokes a macro ---
+        let path: Arc<Path> = Arc::from(Path::new("example.txt"));
+        let file = ctx.get_for_path(path.clone());
 
-        // find actual byte offsets for "macro!(b)"
-        let outer_start = text_a.find("macro!(").unwrap();
-        let outer_end = outer_start + "macro!(b)".len();
-        let src_outer = Loc {
-            src: Source::File(file_a.id),
+        let text = "a + macro!(b + 1.2.3)\n";
+        file.text.set(Ok(text.to_string())).unwrap();
+
+        // locate "macro!(b + 1.2.3)" inside the outer file
+        let outer_start = text.find("macro!(").unwrap();
+        let outer_end = text.find(")\n").unwrap() + 1;
+        let loc_outer = Loc {
+            src: Source::File(file.id),
             start: outer_start,
             end: outer_end,
         };
 
-        // --- macro body text ---
-        let path_b: Arc<Path> = Arc::from(Path::new("inner_macro.txt"));
-        let file_b = files.get_for_path(path_b.clone());
-        let text_b = "b + 1.2.3\n";
-        file_b.text.set(Ok(text_b.to_string())).unwrap();
+        // --- simulate macro body text ---
+        let macro_text = "b + 1.2.3"; // same string, just extracted body
+        let macro_id = ctx.add_macro(loc_outer, macro_text.to_string());
 
-        // add the macro definition
-        let macro_id = macros.add(src_outer, text_b.to_string());
-
-        // locate the malformed number inside the macro: "1.2.3"
-        let bad_start = text_b.find("1.2.3").unwrap();
+        // locate bad token "1.2.3" inside the macro body
+        let bad_start = macro_text.find("1.2.3").unwrap();
         let bad_end = bad_start + "1.2.3".len();
         let loc_inner = Loc {
             src: Source::Macro(macro_id),
@@ -551,22 +583,112 @@ other_line
             end: bad_end,
         };
 
-        // outer slice covering the macro call in the original file
-        let outer_loc = src_outer;
-
-        // combine both
-        let error_loc = Location::Many([outer_loc, loc_inner].into());
-
+        // fake error to attach a location to
         #[derive(Debug, Error)]
         #[error("demo numeric parse failure")]
         struct FakeError;
 
         let located_err = Located {
             value: FakeError,
-            loc: error_loc,
+            loc: loc_inner,
         };
 
+        // Build the mapped error (macro -> outer file)
         let mapped = ctx.add_context(located_err);
+
+        // Panic to display the formatted mapping
         panic!("{}", mapped);
     }
+
+    #[test]
+    fn combine_locs_outer_scope() {
+        // Case 1: both spans in the outer file scope
+        let ctx = SourceContext::new();
+
+        let path: Arc<Path> = Arc::from(Path::new("file.txt"));
+        let file = ctx.get_for_path(path);
+        let text = "aaa bbb ccc";
+        file.text.set(Ok(text.to_string())).unwrap();
+
+        let loc_a = Loc { src: Source::File(file.id), start: 0, end: 3 }; // "aaa"
+        let loc_b = Loc { src: Source::File(file.id), start: 4, end: 7 }; // "bbb"
+
+        let combined = ctx.combine_locs(loc_a, loc_b).unwrap();
+        // expect span covering "aaa bbb"
+        assert_eq!(combined.src, Source::File(file.id));
+        assert_eq!(combined.start, 0);
+        assert_eq!(combined.end, 7);
+    }
+
+    #[test]
+    fn combine_locs_nested_macros_same_outer() {
+        // Case 2: two different macros, both ultimately from the same outer call site
+        let ctx = SourceContext::new();
+
+        // outer file text with two macro calls
+        let path: Arc<Path> = Arc::from(Path::new("file.txt"));
+        let file = ctx.get_for_path(path);
+        let text = "macro1!(a) + macro2!(b)";
+        file.text.set(Ok(text.to_string())).unwrap();
+
+        // locate both macro invocations
+        let m1_start = text.find("macro1!(").unwrap();
+        let m1_end = m1_start + "macro1!(a)".len();
+        let m2_start = text.find("macro2!(").unwrap();
+        let m2_end = m2_start + "macro2!(b)".len();
+
+        let loc_m1_outer = Loc { src: Source::File(file.id), start: m1_start, end: m1_end };
+        let loc_m2_outer = Loc { src: Source::File(file.id), start: m2_start, end: m2_end };
+
+        // each macro expands from those sites
+        let macro1 = ctx.add_macro(loc_m1_outer, "a + 1".to_string());
+        let macro2 = ctx.add_macro(loc_m2_outer, "b + 2".to_string());
+
+        // pick spans *inside* each macro body
+        let loc_a = Loc { src: Source::Macro(macro1), start: 0, end: 1 }; // "a"
+        let loc_b = Loc { src: Source::Macro(macro2), start: 0, end: 1 }; // "b"
+
+        // combine — should bubble up and produce a combined outer span covering both call sites
+        let combined = ctx.combine_locs(loc_a, loc_b).unwrap();
+        assert_eq!(combined.src, Source::File(file.id));
+        assert_eq!(combined.start, m1_start);
+        assert_eq!(combined.end, m2_end);
+    }
+
+    #[test]
+    fn combine_locs_within_nested_macro() {
+        // Case 3: both spans inside the same macro (possibly nested)
+        let ctx = SourceContext::new();
+
+        // outer file has one macro call
+        let path: Arc<Path> = Arc::from(Path::new("outer.txt"));
+        let file = ctx.get_for_path(path);
+        let outer_text = "macro!(inner!(x + y))";
+        file.text.set(Ok(outer_text.to_string())).unwrap();
+
+        let outer_start = outer_text.find("macro!(").unwrap();
+        let outer_end = outer_text.find(')').unwrap() + 1;
+        let loc_outer = Loc { src: Source::File(file.id), start: outer_start, end: outer_end };
+
+        // outer macro expands to something with an inner macro call
+        let macro1 = ctx.add_macro(loc_outer, "inner!(x + y)".to_string());
+        let macro_text = "x + y";
+        let inner_call_start = 7; // "inner!(" starts at byte 7
+        let inner_call_end = inner_call_start + "inner!(x + y)".len();
+        let loc_inner_call = Loc { src: Source::Macro(macro1), start: inner_call_start, end: inner_call_end };
+
+        // inner macro expands to just "x + y"
+        let macro2 = ctx.add_macro(loc_inner_call, macro_text.to_string());
+
+        let loc_a = Loc { src: Source::Macro(macro2), start: 0, end: 1 }; // "x"
+        let loc_b = Loc { src: Source::Macro(macro2), start: 4, end: 5 }; // "y"
+
+        // combine — should succeed entirely within the inner macro
+        let combined = ctx.combine_locs(loc_a, loc_b).unwrap();
+        assert_eq!(combined.src, Source::Macro(macro2));
+        assert_eq!(combined.start, 0);
+        assert_eq!(combined.end, 5);
+    }
+
+
 }
