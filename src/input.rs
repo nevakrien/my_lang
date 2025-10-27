@@ -437,8 +437,6 @@ mod tests {
 }
 #[cfg(test)]
 mod mapped_error_format_tests {
-    use crate::cffi::SliceRC;
-use std::rc::Rc;
 use super::*;
     use crate::parse::BasicLexer;
     use crate::input::Source;
@@ -557,7 +555,7 @@ other_line
         let outer_loc = src_outer;
 
         // combine both
-        let error_loc = Location::Many(SliceRC::new(Rc::from([outer_loc, loc_inner])));
+        let error_loc = Location::Many([outer_loc, loc_inner].into());
 
         #[derive(Debug, Error)]
         #[error("demo numeric parse failure")]

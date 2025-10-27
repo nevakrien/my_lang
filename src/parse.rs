@@ -1,7 +1,6 @@
-
-use crate::cffi::StrRC;
-use crate::cffi::RC;
-use crate::cffi::SliceRC;
+use crate::types::VarID;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::hash::Hash;
 use thiserror::Error;
 use std::collections::HashMap;
@@ -44,7 +43,7 @@ impl Loc {
 #[derive(Clone,PartialEq,Debug)]
 pub enum Location {
 	Simple(Loc),
-	Many(SliceRC<Loc>)
+	Many(Rc<[Loc]>)
 }
 
 impl Location {
@@ -378,33 +377,42 @@ impl<'a> BasicLexer<'a>{
 
 pub type Bp = i32;
 
-#[derive(Debug)]
+#[derive(Debug, Error, Clone)]
 pub enum ParseError<'a> {
+    #[error("{0}")]
     Lex(LexError),
+
+    #[error("unknown name: \"{0}\"")]
     UnknownName(&'a str),
+
+    #[error("\"{0}\" is not a value or prefix operator")]
     MissingPrefix(&'a str),
-    // MissingPostfix(&'a str),
+
+    #[error("expected operand")]
     ExpectedOperand,
 }
 
-pub type ParseRes<'a, T = LAst> = Result<T, Located<ParseError<'a>>>;
-pub type ParseOpRes<'a, T = LAst> = ParseRes<'a, Option<T>>;
+pub type ParseRes<'a, T = LocValue> = Result<T, Located<ParseError<'a>>>;
+pub type ParseOpRes<'a, T = LocValue> = ParseRes<'a, Option<T>>;
 
 impl From<LexError> for ParseError<'_>{
 fn from(e: LexError) -> Self {Self::Lex(e)}
 }
 
 
-#[repr(C,u32)]
+
+
 #[derive(Debug, PartialEq)]
-pub enum Ast{
-	Op(RC<LAst>,SliceRC<LAst>),
-	StringLit(StrRC),
+pub enum Value{
+	Op(Box<LocValue>,Vec<LocValue>),
+	StringLit(String),
 	IntLit(u64),
 	SignedInt(i64),
+	Var(VarID),
+	GlobalVar(VarID),//can be function
 }
 
-pub type LAst = Located<Ast>;
+pub type LocValue = Located<Value>;
 
 // #[derive(Debug, PartialEq)]
 // pub enum Value {
@@ -457,28 +465,20 @@ impl<'a> Lexer<'a> {
 }
 
 
-
-// pub trait ParseElm {
-// 	 fn parse_pre(&self,parser:&mut Parser)->ParseOpRes;
-// 	 fn parse_post(&self,parser:&mut Parser,lhs:Value)->ParseRes;
-// 	 fn postfix_bp(&self)->Option<Bp>;
-// }
-
 pub trait PrefixParse {
-	fn parse<'a>(&self,parser:&mut Parser<'a>)->ParseRes<'a>;
+	fn parse<'a>(&self,parser:&mut Parser<'_,'a>)->ParseRes<'a>;
 	fn bp(&self)->Bp;
 }
 
 pub trait InfixOp {
-	fn combine(&self,lhs:LAst,rhs:LAst)->ParseRes<'static>;
+	fn combine(&self,lhs:LocValue,rhs:LocValue)->ParseRes<'static>;
 	fn bp(&self)->Bp;
 }
 
 pub trait PostfixOp {
-	fn combine<'a>(&self,lhs:LAst,parser:&mut Parser<'a>)->ParseRes<'a>;
+	fn parse<'a>(&self,lhs:LocValue,parser:&mut Parser<'_,'a>)->ParseRes<'a>;
 	fn bp(&self)->Bp;
 }
-
 
 pub enum PostParse {
 	Infix(Box<dyn InfixOp>),
@@ -490,19 +490,43 @@ pub struct ParseOptions {
 	pub post:Option<PostParse>,
 }
 
-type KnowenName = RC<ParseOptions>;
+type KnowenName = Rc<ParseOptions>;
 
 
-pub struct Parser<'a> {
+pub struct Scope<'b,K,V>{
+	pub owned:HashMap<K,V>,
+	pub parent:Option<&'b Scope<'b,K,V>>,
+}
+
+impl<K:Hash+Eq, V> Scope<'_, K, V>{
+	pub fn get(&self,key:K)->Option<&V>{
+		match self.owned.get(&key){
+			Some(x)=>Some(x),
+			None=>self.parent?.get(key)
+		}
+	}
+
+	pub fn get_ref(&self,key:&K)->Option<&V>{
+		match self.owned.get(key){
+			Some(x)=>Some(x),
+			None=>self.parent?.get_ref(key)
+		}
+	}
+}
+
+pub struct Parser<'me,'a> {
 	pub lexer:Lexer<'a>,
-	names:HashMap<&'a str,KnowenName>,
+	names:Scope<'me,&'a str,KnowenName>,
 }
 
 
-impl<'a> Parser<'a>{
+impl<'me,'a> Parser<'me,'a>{
 	 pub fn new_defualt(lexer: Lexer<'a>) -> Self {
-        let mut names = HashMap::new();
-
+        let mut owned = HashMap::new();
+        let names = Scope{
+        	owned,
+        	parent:None
+        };
         
 
         Self { lexer, names }
@@ -520,9 +544,9 @@ impl<'a> Parser<'a>{
 	    };
 
 	    // --- prefix / atom phase ---
-	    let mut lhs: LAst = match tok.value {
-	        Token::Str(s) => tok.loc.with(Ast::StringLit(s.into())),
-	        Token::Num(i) => tok.loc.with(Ast::IntLit(i)),
+	    let mut lhs: LocValue = match tok.value {
+	        Token::Str(s) => tok.loc.with(Value::StringLit(s.into())),
+	        Token::Num(i) => tok.loc.with(Value::IntLit(i)),
 	        Token::Name(n) => {
 	            let name = tok.with(n); // Located<&str>
 
@@ -572,7 +596,7 @@ impl<'a> Parser<'a>{
 	        let op_tok = self.lexer.next()?.unwrap(); // consume operator token
 
 	        lhs = match post {
-	            PostParse::Postfix(op) => op.combine(lhs, self)?,
+	            PostParse::Postfix(op) => op.parse(lhs, self)?,
 	            PostParse::Infix(op) => {
 	                let rhs = self
 	                    .expr_bp(l_bp)?
