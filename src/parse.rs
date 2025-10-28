@@ -1,3 +1,4 @@
+use either::Either;
 use crate::types::GVarID;
 use crate::input::SourceContext;
 use crate::types::VarID;
@@ -45,7 +46,7 @@ impl Loc {
 
 
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone,Copy, Debug, PartialEq)]
 pub struct Located<T> {
     pub value: T,
     pub loc: Loc,
@@ -414,6 +415,7 @@ pub enum Ast{
 	/// it is fairly rare
 	DynCall(Box<LocAst>,Box<[LocAst]>),
 	StringLit(String),
+	Void,
 	IntLit(u64),
 	SignedInt(i64),
 	Var(VarID),
@@ -501,8 +503,49 @@ impl PrefixParse for BasicPrefix {
 
 pub struct ParenPrefix;
 
+
 impl PrefixParse for ParenPrefix {
 	fn parse<'a>(&self,my_loc:Loc,parser:&mut Parser<'_,'a>)->ParseRes<'a>{
+		//helper for handeling closing paren
+		let check_closer_error = |closer:&Located<Token<'a>>| {
+			match closer.value {
+				Token::Name(")")=>{
+					Ok(())
+				},
+				Token::Name(t)=>{
+					Err(closer.loc.with(ParseError::ExpectedParenClose(t)))
+				},
+				Token::Str(_)=>{
+					Err(closer.loc.with(ParseError::ExpectedParenCloseString))
+				},
+				Token::Num(_)=>{
+					Err(closer.loc.with(ParseError::ExpectedParenCloseNum))
+				},
+			}
+		};
+
+		//check for ()
+
+		if let Some(loc) = parser.try_name(")")?{
+			let loc = parser.ctx.combine_locs(loc,my_loc).expect("bad parse stack");
+			return Ok(loc.with(Ast::Void));
+		}
+
+		if let Some(_) = parser.try_name(",")?{
+			let Some(closer) = parser.lexer.next()? else {
+				return Err(my_loc.with(ParseError::ExpectedParenCloseEOF))
+			};
+			check_closer_error(&closer)?;
+
+			let loc = parser.ctx.combine_locs(closer.loc,my_loc).expect("bad parse stack");
+			return Ok(loc.with(Ast::Op(OpCall{
+				rator:loc.with(OpID::TUPLE),
+				rands:[].into(),
+			})))
+		}
+
+
+
 		let Some(lhs) = parser.expr_bp(Bp::MIN)? else {
 			return Err(my_loc.with(ParseError::ExpectedValue))
 		};
@@ -511,23 +554,47 @@ impl PrefixParse for ParenPrefix {
 			return Err(my_loc.with(ParseError::ExpectedParenCloseEOF))
 		};
 
-		match closer.value {
-			Token::Name(")")=>{},
-			Token::Name(t)=>{
-				return Err(closer.loc.with(ParseError::ExpectedParenClose(t)));
-			},
-			Token::Str(_)=>{
-				return Err(closer.loc.with(ParseError::ExpectedParenCloseString));
-			},
-			Token::Num(_)=>{
-				return Err(closer.loc.with(ParseError::ExpectedParenCloseNum));
-			},
-		}
-
-		let loc = parser.ctx.combine_locs(closer.loc,my_loc).expect("bad parse stack");
 		
 
-		Ok(loc.with(lhs.value))
+		match closer.value {
+			Token::Name(")")=>{
+				let loc = parser.ctx.combine_locs(closer.loc,my_loc).expect("bad parse stack");
+				Ok(loc.with(lhs.value))
+			},
+			Token::Name(",")=>{
+				let mut parts = vec![lhs];
+				loop {
+					if let Some(_) = parser.check_name(")")?{
+						break;
+					}
+
+					let Some(exp) = parser.expr_bp(Bp::MIN)? else{
+						break;
+					};
+					parts.push(exp);
+					let Some(_) = parser.try_name(",")? else {
+						break;
+					};
+
+				}
+				let Some(closer) = parser.lexer.next()? else {
+					return Err(my_loc.with(ParseError::ExpectedParenCloseEOF))
+				};
+				check_closer_error(&closer)?;
+
+				let loc = parser.ctx.combine_locs(closer.loc,my_loc).expect("bad parse stack");
+				Ok(loc.with(Ast::Op(OpCall{
+					rator:loc.with(OpID::TUPLE),
+					rands:parts.into(),
+				})))
+			},
+			_=>{
+				check_closer_error(&closer)?;
+				unreachable!();
+			},
+			
+		}
+
 	}
 }
 
@@ -643,12 +710,13 @@ impl OpID {
 
     // ----- Assignment -----
     pub const ASSIGN:     Self = OpID(40);  // =
+    pub const TUPLE:      Self = OpID(41);  // (x,y,..)
 
     // ----- Access -----
-    pub const DOT:        Self = OpID(41);  // .
+    pub const DOT:        Self = OpID(42);  // .
 
     // ----- Postfix -----
-    pub const QMARK_POST: Self = OpID(42);  // ?
+    pub const QMARK_POST: Self = OpID(43);  // ?
 }
 
 
@@ -781,6 +849,37 @@ impl<'me, 'a> Parser<'me, 'a> {
 	    Self { lexer, names, ctx }
 	}
 
+	#[inline]
+	pub fn try_name(&mut self,need:&str)->ParseOpRes<'a,Loc>{
+		match self.check_name(need)?{
+			Some(loc)=>{
+				_ = self.lexer.next();
+				Ok(Some(loc))
+			},
+			None=>Ok(None),
+		}
+	}
+
+	#[inline]
+	pub fn check_name(&mut self,need:&str)->ParseOpRes<'a,Loc>{
+		let (name,loc) = match self.lexer.peek()?{
+			Some(Located{
+				value:Token::Name(n),
+				loc
+			})=>{
+				(*n,*loc)
+			},
+			_=>return Ok(None),
+		};
+
+		if name==need{
+			// _=self.lexer.next();
+			Ok(Some(loc))
+		}else{
+			Ok(None)
+		}
+
+	}
 
 	#[inline(always)]
 	pub fn parse_exp(&mut self)->ParseOpRes<'a>{
@@ -914,19 +1013,36 @@ fn test_lexer_qmark(){
 mod parser_tests {
     use super::*;
 
-    macro_rules! parse_single {
-        ($src_text:expr) => {{
-            let src = Source::File(FileId(0));
-            let lexer = Lexer::new($src_text, src);
-            let ctx = SourceContext::new();
-            let mut parser = Parser::new_default(lexer, &ctx);
-            match parser.parse_exp() {
-                Ok(Some(ast)) => ast,
-                Ok(None) => panic!("no expression parsed in {:?}", $src_text),
-                Err(e) => panic!("parse error: {:?}", e),
-            }
-        }};
-    }
+   macro_rules! parse_single {
+	    ($src_text:expr) => {{
+	        use std::path::Path;
+	        use std::sync::Arc;
+
+	        // Create a SourceContext and register a pseudo file for the test
+	        let ctx = SourceContext::new();
+	        let path: Arc<Path> = Arc::from(Path::new("test_input.txt"));
+	        let file = ctx.get_for_path(path.clone());
+
+	        // Initialize the text cell so errors can be mapped back
+	        file.text.set(Ok($src_text.to_string())).unwrap();
+
+	        // Use that file’s Source handle in the lexer
+	        let src = Source::File(file.id);
+	        let lexer = Lexer::new($src_text, src);
+	        let mut parser = Parser::new_default(lexer, &ctx);
+
+	        match parser.parse_exp() {
+	            Ok(Some(ast)) => ast,
+	            Ok(None) => panic!("no expression parsed in {:?}", $src_text),
+	            Err(e) => {
+	                // Upgrade with line/column context before panicking
+	                let mapped = ctx.add_context(e);
+	                panic!("parse error:\n{}", mapped);
+	            }
+	        }
+	    }};
+	}
+
 
     /// Assert an OpID equals the expected value.
     macro_rules! assert_global {
@@ -1175,4 +1291,104 @@ mod parser_tests {
             other => panic!("expected + as root, got {:?}", other),
         }
     }
+
+        #[test]
+    fn parses_unit_expression() {
+        // ()
+        let ast = parse_single!("()");
+        println!("got {ast:?}");
+        match ast.value {
+            Ast::Void => {}
+            other => panic!("expected Ast::Void, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_grouped_expression_not_tuple() {
+        // ("a") → just "a"
+        let ast = parse_single!(r#"("a")"#);
+        println!("got {ast:?}");
+        match &ast.value {
+            Ast::StringLit(s) => assert_eq!(s, "a"),
+            other => panic!("expected grouped StringLit(\"a\"), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_single_element_tuple() {
+        // ("a",) → 1-tuple
+        let ast = parse_single!(r#"("a",)"#);
+        println!("got {ast:?}");
+        match &ast.value {
+            Ast::Op(call) => {
+                assert_global!(&call.rator.value, OpID::TUPLE);
+                assert_eq!(call.rands.len(), 1);
+                match &call.rands[0].value {
+                    Ast::StringLit(s) => assert_eq!(s, "a"),
+                    other => panic!("expected single tuple element 'a', got {:?}", other),
+                }
+            }
+            other => panic!("expected tuple Op(TUPLE), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_multi_element_tuple() {
+        // ("a", "b", "c")
+        let ast = parse_single!(r#"("a", "b", "c")"#);
+        println!("got {ast:?}");
+        match &ast.value {
+            Ast::Op(call) => {
+                assert_global!(&call.rator.value, OpID::TUPLE);
+                assert_eq!(call.rands.len(), 3);
+                let vals: Vec<_> = call.rands.iter().map(|x| match &x.value {
+                    Ast::StringLit(s) => s.as_str(),
+                    other => panic!("expected string lit, got {:?}", other),
+                }).collect();
+                assert_eq!(vals, ["a", "b", "c"]);
+            }
+            other => panic!("expected tuple Op(TUPLE), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_nested_tuple_inside_expression() {
+        // ("a", ("b", "c"))
+        let ast = parse_single!(r#"("a", ("b", "c"))"#);
+        println!("got {ast:?}");
+        match &ast.value {
+            Ast::Op(call) => {
+                assert_global!(&call.rator.value, OpID::TUPLE);
+                assert_eq!(call.rands.len(), 2);
+                match &call.rands[1].value {
+                    Ast::Op(inner) => {
+                        assert_global!(&inner.rator.value, OpID::TUPLE);
+                        assert_eq!(inner.rands.len(), 2);
+                    }
+                    other => panic!("expected inner tuple as second element, got {:?}", other),
+                }
+            }
+            other => panic!("expected outer tuple, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_empty_tuple_literal() {
+        // "(,)" represents an empty tuple, distinct from void "()"
+        let ast = parse_single!("(,)");
+        println!("got {ast:?}");
+        match &ast.value {
+            Ast::Op(call) => {
+                assert_global!(&call.rator.value, OpID::TUPLE);
+                assert!(
+                    call.rands.is_empty(),
+                    "expected 0 tuple elements, got {:?}",
+                    call.rands.len()
+                );
+            }
+            other => panic!("expected Ast::Op(TUPLE) for '(,)', got {:?}", other),
+        }
+    }
+
+
 }
