@@ -173,19 +173,32 @@ impl SourceContext {
     pub fn get_macro(&self,id:MacroId)->Option<&MacroCall>{
         self.macros.get(id.0 as usize)
     }
+
+    pub fn get_text(&self,loc:Loc)->Option<&str>{
+        Some(match loc.src {
+            Source::Macro(m)=>&self.get_macro(m)?.text[loc.start..loc.end],
+            Source::File(f)=>{
+                let text = self.get_file(f)?.text.get()?.as_ref().ok()?;
+                &text[loc.start..loc.end]
+            },
+        })
+    }
 }
 
 
 
+/// A fully resolved error (with mapped spans and printable formatting).
 #[derive(Debug)]
 pub struct MappedError<'a, E: Error> {
     pub inner: E,
     pub spans: Vec<MappedSpan<'a>>,
 }
 
+/// A contiguous highlight region within one source line.
 #[derive(Debug)]
 pub struct MappedSpan<'a> {
-    pub src: Source,
+    /// Optional human-readable name of the source (file path or macro label)
+    pub src_name: Option<&'a str>,
     pub line: LineNum,
     pub line_text: &'a str,
     pub col_start: usize,
@@ -195,11 +208,16 @@ pub struct MappedSpan<'a> {
 impl<'a, E: Error> fmt::Display for MappedError<'a, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "{}", self.inner)?;
-        let mut last_src: Option<Source> = None;
+
+        let mut last_src: Option<Option<&str>> = None;
+
         for span in &self.spans {
-            if last_src != Some(span.src) {
-                writeln!(f, "\nIn {:?}:", span.src)?;
-                last_src = Some(span.src);
+            if last_src != Some(span.src_name) {
+                match span.src_name {
+                    Some(name) => writeln!(f, "\nIn {name}:")?,
+                    None => writeln!(f, "\nIn <macro expansion>:")?,
+                }
+                last_src = Some(span.src_name);
             }
 
             writeln!(f, " --> line {}", span.line.0)?;
@@ -208,35 +226,157 @@ impl<'a, E: Error> fmt::Display for MappedError<'a, E> {
                 f,
                 "  | {}{}",
                 " ".repeat(span.col_start),
-                "^".repeat(span.col_end.saturating_sub(span.col_start).max(1))
+                "^".repeat(span.col_end.saturating_sub(span.col_start))//.max(1))
             )?;
         }
+
         Ok(())
     }
 }
 
-impl<'a, E: Error > Error for MappedError<'a, E> {
+impl<'a, E: Error> Error for MappedError<'a, E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         self.inner.source()
     }
 }
 
 impl<'a> SourceContext {
-    pub fn add_context<E: Error>(&'a self, error: Located<E>) -> MappedError<'a, E> {
+    /// Attach readable spans to an error.
+    pub fn add_context<E: Error>(&'a self, error: crate::parse::Located<E>) -> MappedError<'a, E> {
         let mut loc = error.loc;
-        let mut spans = Vec::with_capacity(1);
+        let mut spans = Vec::new();
 
+        // include spans from inner macros upward
         while let Source::Macro(id) = loc.src {
-           spans.push(self.map_loc_to_span(loc));
-           loc = self.get_macro(id).expect("macro does not exist").src; 
+            spans.extend(self.map_loc_to_span(loc));
+            loc = self.get_macro(id).expect("macro does not exist").src;
         }
 
-        spans.push(self.map_loc_to_span(loc));
+        // add outermost file span
+        spans.extend(self.map_loc_to_span(loc));
 
         MappedError {
             inner: error.value,
             spans,
         }
+    }
+
+    /// Attach context: `full` determines what lines to show,
+    /// `problem` determines which exact region is highlighted.
+    pub fn add_context_for<E: Error>(
+        &'a self,
+        full: Loc,
+        problem: Loc,
+        error: E,
+    ) -> MappedError<'a, E> {
+        let (map, text, src_name): (&LineMap, &str, Option<&'a str>) = match full.src {
+            Source::File(id) => {
+                let info = self.get_file(id).expect("file does not exist");
+                let name = info.path.to_str();
+                (info.get_line_map(), info.text.get().unwrap().as_ref().unwrap(), name)
+            }
+            Source::Macro(id) => {
+                let info = self.get_macro(id).expect("macro does not exist");
+                (info.get_line_map(), info.text.as_ref(), None)
+            }
+        };
+
+        let start_line = map.line_num(full.start).0;
+        let end_line = map.line_num(full.end).0;
+
+        let problem_start_line = map.line_num(problem.start).0;
+        let problem_end_line = map.line_num(problem.end).0;
+
+        let mut spans = Vec::new();
+
+        for line_idx in start_line..=end_line {
+            let line = LineNum(line_idx);
+            let line_text = map.line_text(line, text);
+            let line_start = map.line_start(line);
+            let line_end = map.line_end(line);
+
+            // Default: no highlight on this line
+            let mut col_start = 0;
+            let mut col_end = 0;
+
+            // Only mark if this line intersects the problem region
+            if line_idx >= problem_start_line && line_idx <= problem_end_line {
+                col_start = if line_idx == problem_start_line {
+                    problem.start.saturating_sub(line_start)
+                } else {
+                    0
+                };
+                col_end = if line_idx == problem_end_line {
+                    problem.end.min(line_end).saturating_sub(line_start)
+                } else {
+                    line_end - line_start
+                };
+
+                // handle zero-length cases like EOF — draw one caret minimum
+                if col_start == col_end {
+                    col_end = col_start + 1;
+                }
+            }
+
+            spans.push(MappedSpan {
+                src_name,
+                line,
+                line_text,
+                col_start,
+                col_end,
+            });
+        }
+
+        MappedError { inner: error, spans }
+    }
+
+
+    /// Multi-line mapping logic.
+     fn map_loc_to_span(&'a self, loc: Loc) -> Vec<MappedSpan<'a>> {
+        let (map, text, src_name): (&LineMap, &str, Option<&'a str>) = match loc.src {
+            Source::File(id) => {
+                let info = self.get_file(id).expect("file does not exist");
+                let name = info.path.to_str();
+                (info.get_line_map(), info.text.get().unwrap().as_ref().unwrap(), name)
+            }
+            Source::Macro(id) => {
+                let info = self.get_macro(id).expect("macro does not exist");
+                let name = None; // macros don’t have real names
+                (info.get_line_map(), info.text.as_ref(), name)
+            }
+        };
+
+        let start_line = map.line_num(loc.start).0;
+        let end_line = map.line_num(loc.end).0;
+        let mut spans = Vec::new();
+
+        for line_idx in start_line..=end_line {
+            let line = LineNum(line_idx);
+            let line_text = map.line_text(line, text);
+            let line_start = map.line_start(line);
+            let line_end = map.line_end(line);
+
+            let col_start = if line_idx == start_line {
+                loc.start - line_start
+            } else {
+                0
+            };
+            let col_end = if line_idx == end_line {
+                loc.end.min(line_end) - line_start
+            } else {
+                line_end - line_start
+            };
+
+            spans.push(MappedSpan {
+                src_name,
+                line,
+                line_text,
+                col_start,
+                col_end,
+            });
+        }
+
+        spans
     }
 
     #[inline]
@@ -309,25 +449,6 @@ impl<'a> SourceContext {
             }
         }
 
-    }
-
-    fn map_loc_to_span(&'a self, loc: Loc) -> MappedSpan<'a> {
-        let (map, text) = self.get_line_map_and_full_text(loc);
-        let line = map.line_num(loc.start);
-        let line_text = map.line_text(line, text);
-        let start_of_line = map.line_start(line);
-        let end_of_line = map.line_end(line);
-
-        let col_start = loc.start - start_of_line;
-        let col_end = loc.end.min(end_of_line) - start_of_line;
-
-        MappedSpan {
-            src: loc.src,
-            line,
-            line_text,
-            col_start,
-            col_end,
-        }
     }
 
     pub fn get_line_map_and_full_text(&'a self,loc:Loc)->(&'a LineMap,&'a str){
@@ -599,6 +720,128 @@ other_line
         // Panic to display the formatted mapping
         panic!("{}", mapped);
     }
+
+      #[test]
+    #[should_panic(expected = "missing closing quote in string")]
+    fn mapped_error_missing_quote_multiline() {
+        // 1️⃣ Prepare context
+        let ctx = SourceContext::new();
+
+        // 2️⃣ Add source text to the context (spans across multiple lines)
+        let path: Arc<Path> = Arc::from(Path::new("test_input.txt"));
+        let file = ctx.get_for_path(path.clone());
+        let src_text = r#"
+"unterminated
+second line
+third line
+"#;
+        file.text.set(Ok(src_text.to_string())).unwrap();
+
+        // 3️⃣ Create the lexer using that *same* text slice
+        let src = Source::File(file.id);
+        let mut lex = BasicLexer::new(src_text, src);
+
+        // 4️⃣ Trigger the lexer error
+        match lex.next() {
+            Err(loc_err) => {
+                let mapped = ctx.add_context(loc_err);
+                // comment out panic to see pretty-printed full multi-line highlight
+                panic!("{}", mapped);
+            }
+            Ok(_) => panic!("expected MissingStringClose"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid number ending with")]
+    fn mapped_error_weird_number_end_eof() {
+        // 1️⃣ Prepare context
+        let ctx = SourceContext::new();
+
+        // 2️⃣ Source with degenerate EOF position (last line empty)
+        let path: Arc<Path> = Arc::from(Path::new("numbers.txt"));
+        let file = ctx.get_for_path(path.clone());
+        let src_text = r#"
+ 123x more stuff
+other_line
+
+"#; // trailing newline ensures EOF on an empty line
+        file.text.set(Ok(src_text.to_string())).unwrap();
+
+        // 3️⃣ Run the lexer
+        let src = Source::File(file.id);
+        let mut lex = BasicLexer::new(src_text, src);
+
+        // 4️⃣ Force error highlighting EOF
+        match lex.next() {
+            Err(loc_err) => {
+                let mapped = ctx.add_context(loc_err);
+                panic!("{}", mapped);
+            }
+            Ok(_) => panic!("expected WeirdNumberEnd"),
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "demo multiline parse failure")]
+    fn mapped_error_multiline_span_across_lines() {
+        use thiserror::Error;
+        #[derive(Debug, Error)]
+        #[error("demo multiline parse failure")]
+        struct DummyMulti;
+
+        let ctx = SourceContext::new();
+        let path: Arc<Path> = Arc::from(Path::new("multi_case.txt"));
+        let file = ctx.get_for_path(path.clone());
+        let text = "( \n\n1, 2\n\n3;\n)";
+        file.text.set(Ok(text.to_string())).unwrap();
+
+        // Limit to the meaningful (1,2 .. 3;) region
+        let full_start = text.find('1').unwrap();
+        let full_end   = text.rfind(')').unwrap(); // exclude trailing newline
+
+        // Problem = the semicolon (pretend parser expected `,`)
+        let problem_start = text.find(';').unwrap();
+        let problem_end   = problem_start + 1;
+
+        let full_loc = Loc { src: Source::File(file.id), start: full_start, end: full_end };
+        let problem_loc = Loc { src: Source::File(file.id), start: problem_start, end: problem_end };
+
+        let mapped = ctx.add_context_for(full_loc, problem_loc, DummyMulti);
+        assert!(mapped.spans.len() >= 2);
+        panic!("{}", mapped);
+    }
+
+    #[test]
+    #[should_panic(expected = "demo eof parse failure")]
+    fn mapped_error_empty_last_line_eof() {
+        use thiserror::Error;
+        #[derive(Debug, Error)]
+        #[error("demo eof parse failure")]
+        struct DummyEof;
+
+        let ctx = SourceContext::new();
+        let path: Arc<Path> = Arc::from(Path::new("eof_case.txt"));
+        let file = ctx.get_for_path(path.clone());
+        let text = "alpha\nbeta\n";
+        file.text.set(Ok(text.to_string())).unwrap();
+
+        // Full = context around the end of beta
+        let full_start = text.find("beta").unwrap();
+        let full_end   = text.len(); // include trailing newline
+
+        // Problem = EOF (0-width range)
+        let eof = text.len();
+        let problem_loc = Loc { src: Source::File(file.id), start: eof, end: eof };
+        let full_loc = Loc { src: Source::File(file.id), start: full_start, end: full_end };
+
+        let mapped = ctx.add_context_for(full_loc, problem_loc, DummyEof);
+        assert!(!mapped.spans.is_empty());
+        panic!("{}", mapped);
+    }
+
+
+
 
     #[test]
     fn combine_locs_outer_scope() {

@@ -1,3 +1,4 @@
+use crate::input::MappedError;
 use crate::types::GVarID;
 use crate::input::SourceContext;
 use crate::types::VarID;
@@ -39,6 +40,15 @@ impl Loc {
             value,
             loc:self
         }
+    }
+
+    #[inline(always)]
+    pub fn empty_after(self)->Loc{
+    	Loc{
+    		src:self.src,
+    		start:self.end,
+    		end:self.end,
+    	}
     }
 }
 
@@ -365,7 +375,7 @@ impl<'a> BasicLexer<'a>{
 
 pub type Bp = i32;
 
-#[derive(Debug, Error, Clone)]
+#[derive(Debug, Error,)]
 pub enum ParseError<'a> {
     #[error("{0}")]
     Lex(LexError),
@@ -391,6 +401,24 @@ pub enum ParseError<'a> {
     #[error("expected \")\" found EOF")]
     ExpectedParenCloseEOF,
 }
+
+// #[derive(Debug, Error,)]
+// pub enum ParseError<'a> {
+// 	#[error("{0}")]
+// 	Lex(LexError),
+
+// 	#[error("unknown name: \"{0}\"")]
+// 	UnknownName(&'a str),
+
+// 	#[error("\"{0}\" is not a value or prefix operator")]
+// 	MissingPrefix(&'a str),
+
+// 	#[error("expected \"{0}\" found \"{1}\"")]
+// 	Unexpected(&'static str,&'a str),
+// }
+
+// pub type PError<'a> = MappedError<'a,ParseError<'a>>;
+// pub type ParseRes<'a, T = LocAst> = Result<T,  PError<'a>>;
 
 pub type ParseRes<'a, T = LocAst> = Result<T, Located<ParseError<'a>>>;
 pub type ParseOpRes<'a, T = LocAst> = ParseRes<'a, Option<T>>;
@@ -419,7 +447,6 @@ pub enum Ast{
 	StringLit(String),
 	Void,
 	IntLit(u64),
-	SignedInt(i64),
 	Var(VarID),
 	GlobalVar(GVarID),//can't be function
 }
