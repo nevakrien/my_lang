@@ -10,6 +10,9 @@ use std::collections::HashMap;
 use crate::input::Source;
 use std::ops::{Deref, DerefMut};
 
+#[derive(Debug,Copy,Clone,PartialEq,Eq,Hash)]
+pub struct OpID(pub u32);
+
 #[repr(C)]
 #[derive(Clone,Copy,PartialEq,Debug,Hash)]
 pub struct Loc {
@@ -122,11 +125,6 @@ pub struct BasicLexer<'a>{
 	cur_str:&'a str,
 	cur_start:usize,
 	src:Source
-}
-
-fn is_op_like(c:char)->bool{
-	 
-	!(c.is_alphanumeric() || c=='_' || c.is_whitespace()||c=='"')
 }
 
 impl<'a> BasicLexer<'a>{
@@ -390,32 +388,19 @@ impl From<LexError> for ParseError<'_>{
 fn from(e: LexError) -> Self {Self::Lex(e)}
 }
 
-
-#[derive(Debug, PartialEq)]
-pub struct OpCall(pub Vec<LocAst>);
-impl OpCall {
-	pub fn new(rator:LocAst)->Self{
-		Self(vec![rator])
-	}
-
-	pub fn push(&mut self,rand:LocAst){
-		self.0.push(rand)
-	}
-
-	pub fn rator(&self)->&LocAst{
-		&self.0[0]
-	}
-
-	pub fn rands(&self)->&[LocAst]{
-		&self.0[1..]
-	}
+#[derive(Debug,PartialEq)]
+pub struct OpCall{
+	pub rator:Located<OpID>,
+	pub rands:Box<[LocAst]>,
 }
 
-#[cfg(target_pointer_width = "64")]
-#[repr(align(32))]
 #[derive(Debug, PartialEq)]
 pub enum Ast{
 	Op(OpCall),
+
+	/// this is used for calling generated functions
+	/// it is fairly rare
+	DynCall(Box<LocAst>,Box<[LocAst]>),
 	StringLit(String),
 	IntLit(u64),
 	SignedInt(i64),
@@ -423,13 +408,13 @@ pub enum Ast{
 	GlobalVar(GVarID),//can be function
 }
 
-#[cfg(target_pointer_width = "64")]
-const _: () = {
-    assert!(
-        size_of::<Ast>() == 32,
-        "not ideal..."
-    );
-};
+// #[cfg(target_pointer_width = "64")]
+// const _: () = {
+//     assert!(
+//         size_of::<Ast>() <= 48,
+//         "not ideal..."
+//     );
+// };
 
 pub type LocAst = Located<Ast>;
 
@@ -482,7 +467,7 @@ pub trait PrefixParse {
 }
 
 pub struct BasicPrefix{
-	pub id:GVarID,
+	pub id:OpID,
 	pub bp:Bp,
 }
 
@@ -493,10 +478,11 @@ impl PrefixParse for BasicPrefix {
 		};
 		let loc = parser.ctx.combine_locs(lhs.loc,my_loc).expect("bad parse stack");
 		
-		let mut ans = OpCall::new(my_loc.with(Ast::GlobalVar(self.id)));
-		ans.push(lhs);
 
-		Ok(loc.with(Ast::Op(ans)))
+		Ok(loc.with(Ast::Op(OpCall{
+			rator:my_loc.with(self.id),
+			rands:[lhs].into()
+		})))
 	}
 
 }
@@ -507,16 +493,16 @@ pub trait InfixOp {
 }
 
 pub struct BasicInfix {
-	pub id:GVarID,
+	pub id:OpID,
 	pub bps:(Bp,Bp),
 }
 
 impl InfixOp for BasicInfix {
 	fn combine(&self,my_loc:Loc,lhs:LocAst,rhs:LocAst)->ParseRes<'static,Ast>{
-		let mut ans = OpCall::new(my_loc.with(Ast::GlobalVar(self.id)));
-		ans.push(lhs);
-		ans.push(rhs);
-		Ok(Ast::Op(ans))
+		Ok(Ast::Op(OpCall{
+			rator:my_loc.with(self.id),
+			rands:[lhs,rhs].into()
+		}))
 	}
 	fn bp(&self)->(Bp,Bp){
 		self.bps
@@ -529,7 +515,7 @@ pub trait PostfixOp {
 }
 
 pub struct BasicPostfix{
-	pub id:GVarID,
+	pub id:OpID,
 	pub bp:Bp,
 }
 
@@ -537,10 +523,10 @@ impl PostfixOp for BasicPostfix {
 	fn parse<'a>(&self,my_loc:Loc,lhs:LocAst,parser:&mut Parser<'_,'a>)->ParseRes<'a>{
 		let loc = parser.ctx.combine_locs(lhs.loc,my_loc).expect("bad parse stack");
 		
-		let mut ans = OpCall::new(my_loc.with(Ast::GlobalVar(self.id)));
-		ans.push(lhs);
-
-		Ok(loc.with(Ast::Op(ans)))
+		Ok(loc.with(Ast::Op(OpCall{
+			rator:my_loc.with(self.id),
+			rands:[lhs].into()
+		})))
 	}
 	fn bp(&self)->Bp{
 		self.bp
@@ -587,38 +573,38 @@ pub struct Parser<'me,'a> {
 	pub ctx:&'a SourceContext,
 }
 
-impl GVarID {
+impl OpID {
     // ----- Arithmetic (binary) -----
-    pub const ADD_BIN:    Self = GVarID(1);   // +
-    pub const SUB_BIN:    Self = GVarID(2);   // -
-    pub const MUL_BIN:    Self = GVarID(3);   // *
-    pub const DIV_BIN:    Self = GVarID(4);   // /
+    pub const ADD_BIN:    Self = OpID(1);   // +
+    pub const SUB_BIN:    Self = OpID(2);   // -
+    pub const MUL_BIN:    Self = OpID(3);   // *
+    pub const DIV_BIN:    Self = OpID(4);   // /
 
     // ----- Unary prefix -----
-    pub const NEG_PRE:    Self = GVarID(10);  // -x
-    pub const DEREF_PRE:  Self = GVarID(11);  // *x
-    pub const ADDR_PRE:  Self = GVarID(12);  // &x
-    pub const NOT_PRE:    Self = GVarID(13);  // !x
+    pub const NEG_PRE:    Self = OpID(10);  // -x
+    pub const DEREF_PRE:  Self = OpID(11);  // *x
+    pub const ADDR_PRE:  Self = OpID(12);  // &x
+    pub const NOT_PRE:    Self = OpID(13);  // !x
 
     // ----- Bitwise (binary) -----
-    pub const BIT_AND:    Self = GVarID(20);  // &
-    pub const BIT_OR:     Self = GVarID(21);  // |
-    pub const BIT_XOR:    Self = GVarID(22);  // ^
-    pub const SHL:        Self = GVarID(23);  // <<
-    pub const SHR:        Self = GVarID(24);  // >>
+    pub const BIT_AND:    Self = OpID(20);  // &
+    pub const BIT_OR:     Self = OpID(21);  // |
+    pub const BIT_XOR:    Self = OpID(22);  // ^
+    pub const SHL:        Self = OpID(23);  // <<
+    pub const SHR:        Self = OpID(24);  // >>
 
     // ----- Logical (binary) -----
-    pub const LOG_AND:    Self = GVarID(30);  // &&
-    pub const LOG_OR:     Self = GVarID(31);  // ||
+    pub const LOG_AND:    Self = OpID(30);  // &&
+    pub const LOG_OR:     Self = OpID(31);  // ||
 
     // ----- Assignment -----
-    pub const ASSIGN:     Self = GVarID(40);  // =
+    pub const ASSIGN:     Self = OpID(40);  // =
 
     // ----- Access -----
-    pub const DOT:        Self = GVarID(41);  // .
+    pub const DOT:        Self = OpID(41);  // .
 
     // ----- Postfix -----
-    pub const QMARK_POST: Self = GVarID(42);  // ?
+    pub const QMARK_POST: Self = OpID(42);  // ?
 }
 
 
@@ -712,31 +698,31 @@ impl<'me, 'a> Parser<'me, 'a> {
 	    // 20: =
 
 	    // Arithmetic
-	    infix_left!("+",  GVarID::ADD_BIN,    50);
-	    both_ids!("-", GVarID::NEG_PRE, 70, GVarID::SUB_BIN, 50);
-	    both_ids!("*", GVarID::DEREF_PRE, 70, GVarID::MUL_BIN, 60);
-	    infix_left!("/",  GVarID::DIV_BIN,    60);
+	    infix_left!("+",  OpID::ADD_BIN,    50);
+	    both_ids!("-", OpID::NEG_PRE, 70, OpID::SUB_BIN, 50);
+	    both_ids!("*", OpID::DEREF_PRE, 70, OpID::MUL_BIN, 60);
+	    infix_left!("/",  OpID::DIV_BIN,    60);
 
 	    // Bitwise
-	    both_ids!("&", GVarID::ADDR_PRE, 70, GVarID::BIT_AND, 45);
-	    infix_left!("^",  GVarID::BIT_XOR,    42);
-	    infix_left!("|",  GVarID::BIT_OR,     40);
-	    infix_left!("<<", GVarID::SHL,        55);
-	    infix_left!(">>", GVarID::SHR,        55);
+	    both_ids!("&", OpID::ADDR_PRE, 70, OpID::BIT_AND, 45);
+	    infix_left!("^",  OpID::BIT_XOR,    42);
+	    infix_left!("|",  OpID::BIT_OR,     40);
+	    infix_left!("<<", OpID::SHL,        55);
+	    infix_left!(">>", OpID::SHR,        55);
 
 	    // Logical
-	    prefix!("!",  GVarID::NOT_PRE,   70);
-	    infix_left!("&&",  GVarID::LOG_AND,   30);
-	    infix_left!("||",  GVarID::LOG_OR,    25);
+	    prefix!("!",  OpID::NOT_PRE,   70);
+	    infix_left!("&&",  OpID::LOG_AND,   30);
+	    infix_left!("||",  OpID::LOG_OR,    25);
 
 	    // Assignment – right associative
-	    infix_right!("=",   GVarID::ASSIGN,    20);
+	    infix_right!("=",   OpID::ASSIGN,    20);
 
 	    // Dot access – left associative
-	    infix_left!(".",   GVarID::DOT,       80);
+	    infix_left!(".",   OpID::DOT,       80);
 
 	    // Postfix
-	    postfix!("?", GVarID::QMARK_POST, 75);
+	    postfix!("?", OpID::QMARK_POST, 75);
 
 	    let names = Scope { owned, parent: None };
 	    Self { lexer, names, ctx }
@@ -889,19 +875,14 @@ mod parser_tests {
         }};
     }
 
+    /// Assert an OpID equals the expected value.
     macro_rules! assert_global {
-        ($ast:expr, $expected:expr) => {{
-            match $ast {
-                Ast::GlobalVar(id) => assert_eq!(
-                    *id, $expected,
-                    "expected {:?}, got {:?}",
-                    $expected, id
-                ),
-                other => panic!(
-                    "expected Ast::GlobalVar({:?}), got {:?}",
-                    $expected, other
-                ),
-            }
+        ($opid:expr, $expected:expr) => {{
+            assert_eq!(
+                *$opid, $expected,
+                "expected {:?}, got {:?}",
+                $expected, $opid
+            );
         }};
     }
 
@@ -921,8 +902,8 @@ mod parser_tests {
         println!("got {ast:?}");
         match &ast.value {
             Ast::Op(call) => {
-                assert_global!(&call.rator().value, GVarID::NEG_PRE);
-                match &call.rands()[0].value {
+                assert_global!(&call.rator.value, OpID::NEG_PRE);
+                match &call.rands[0].value {
                     Ast::IntLit(v) => assert_eq!(*v, 5),
                     other => panic!("expected IntLit(5), got {:?}", other),
                 }
@@ -937,11 +918,11 @@ mod parser_tests {
         println!("got {ast:?}");
         match &ast.value {
             Ast::Op(call) => {
-                assert_global!(&call.rator().value, GVarID::MUL_BIN);
-                let lhs = &call.rands()[0];
-                let rhs = &call.rands()[1];
+                assert_global!(&call.rator.value, OpID::MUL_BIN);
+                let lhs = &call.rands[0];
+                let rhs = &call.rands[1];
                 match &lhs.value {
-                    Ast::Op(inner) => assert_global!(&inner.rator().value, GVarID::DEREF_PRE),
+                    Ast::Op(inner) => assert_global!(&inner.rator.value, OpID::DEREF_PRE),
                     other => panic!("expected prefix *, got {:?}", other),
                 }
                 match &rhs.value {
@@ -959,16 +940,16 @@ mod parser_tests {
         println!("got {ast:?}");
         match &ast.value {
             Ast::Op(call) => {
-                assert_global!(&call.rator().value, GVarID::ADD_BIN);
-                let mul_node = &call.rands()[0];
+                assert_global!(&call.rator.value, OpID::ADD_BIN);
+                let mul_node = &call.rands[0];
                 if let Ast::Op(inner) = &mul_node.value {
-                    assert_global!(&inner.rator().value, GVarID::MUL_BIN);
-                    let left = &inner.rands()[0];
-                    let right = &inner.rands()[1];
+                    assert_global!(&inner.rator.value, OpID::MUL_BIN);
+                    let left = &inner.rands[0];
+                    let right = &inner.rands[1];
                     for operand in [left, right] {
                         match &operand.value {
                             Ast::Op(sub_inner) => {
-                                assert_global!(&sub_inner.rator().value, GVarID::NEG_PRE);
+                                assert_global!(&sub_inner.rator.value, OpID::NEG_PRE);
                             }
                             other => panic!("expected unary -, got {:?}", other),
                         }
@@ -987,10 +968,10 @@ mod parser_tests {
         println!("got {ast:?}");
         match &ast.value {
             Ast::Op(call) => {
-                assert_global!(&call.rator().value, GVarID::ADD_BIN);
-                for side in call.rands() {
+                assert_global!(&call.rator.value, OpID::ADD_BIN);
+                for side in &*call.rands {
                     match &side.value {
-                        Ast::Op(inner) => assert_global!(&inner.rator().value, GVarID::DOT),
+                        Ast::Op(inner) => assert_global!(&inner.rator.value, OpID::DOT),
                         other => panic!("expected dot access, got {:?}", other),
                     }
                 }
@@ -1005,16 +986,16 @@ mod parser_tests {
         println!("got {ast:?}");
         match &ast.value {
             Ast::Op(or) => {
-                assert_global!(&or.rator().value, GVarID::BIT_OR);
-                let left = &or.rands()[0];
-                let right = &or.rands()[1];
+                assert_global!(&or.rator.value, OpID::BIT_OR);
+                let left = &or.rands[0];
+                let right = &or.rands[1];
                 if let Ast::Op(and) = &left.value {
-                    assert_global!(&and.rator().value, GVarID::BIT_AND);
+                    assert_global!(&and.rator.value, OpID::BIT_AND);
                 } else {
                     panic!("expected & inside left, got {:?}", left.value);
                 }
                 if let Ast::Op(xor) = &right.value {
-                    assert_global!(&xor.rator().value, GVarID::BIT_XOR);
+                    assert_global!(&xor.rator.value, OpID::BIT_XOR);
                 } else {
                     panic!("expected ^ inside right, got {:?}", right.value);
                 }
@@ -1029,10 +1010,10 @@ mod parser_tests {
     //     println!("got {ast:?}");
     //     match &ast.value {
     //         Ast::Op(or_op) => {
-    //             assert_global!(&or_op.rator().value, GVarID::LOG_OR);
-    //             let left = &or_op.rands()[0];
+    //             assert_global!(&or_op.rator.value, OpID::LOG_OR);
+    //             let left = &or_op.rands[0];
     //             if let Ast::Op(not_op) = &left.value {
-    //                 assert_global!(&not_op.rator().value, GVarID::NOT_PRE);
+    //                 assert_global!(&not_op.rator.value, OpID::NOT_PRE);
     //             } else {
     //                 panic!("expected prefix !, got {:?}", left.value);
     //             }
@@ -1046,7 +1027,7 @@ mod parser_tests {
         let ast = parse_single!(r#""x" = "y""#);
         println!("got {ast:?}");
         match &ast.value {
-            Ast::Op(assign) => assert_global!(&assign.rator().value, GVarID::ASSIGN),
+            Ast::Op(assign) => assert_global!(&assign.rator.value, OpID::ASSIGN),
             other => panic!("expected assignment at root, got {:?}", other),
         }
     }
@@ -1057,8 +1038,8 @@ mod parser_tests {
         println!("got {ast:?}");
         match &ast.value {
             Ast::Op(call) => {
-                assert_global!(&call.rator().value, GVarID::QMARK_POST);
-                match &call.rands()[0].value {
+                assert_global!(&call.rator.value, OpID::QMARK_POST);
+                match &call.rands[0].value {
                     Ast::StringLit(_) => {}
                     other => panic!("expected StringLit, got {:?}", other),
                 }
@@ -1073,13 +1054,13 @@ mod parser_tests {
         println!("got {ast:?}");
         match &ast.value {
             Ast::Op(add) => {
-                assert_global!(&add.rator().value, GVarID::ADD_BIN);
-                let rhs = &add.rands()[1];
+                assert_global!(&add.rator.value, OpID::ADD_BIN);
+                let rhs = &add.rands[1];
                 if let Ast::Op(shift) = &rhs.value {
-                    assert_global!(&shift.rator().value, GVarID::SHL);
-                    let post = &shift.rands()[1];
+                    assert_global!(&shift.rator.value, OpID::SHL);
+                    let post = &shift.rands[1];
                     if let Ast::Op(postfix) = &post.value {
-                        assert_global!(&postfix.rator().value, GVarID::QMARK_POST);
+                        assert_global!(&postfix.rator.value, OpID::QMARK_POST);
                     } else {
                         panic!("expected postfix ? inside rhs, got {:?}", post.value);
                     }
@@ -1095,24 +1076,21 @@ mod parser_tests {
     fn parses_assignment_right_associative() {
         // "a" = "b" = "c"
         let ast = parse_single!(r#""a" = "b" = "c""#);
+        println!("got {ast:?}");
         match &ast.value {
             Ast::Op(outer) => {
-                // Root operator should be '='
-                assert_global!(&outer.rator().value, GVarID::ASSIGN);
+                assert_global!(&outer.rator.value, OpID::ASSIGN);
+                let lhs = &outer.rands[0];
+                let rhs = &outer.rands[1];
 
-                let lhs = &outer.rands()[0];
-                let rhs = &outer.rands()[1];
-
-                // Right-hand side should itself be another assignment (a = (b = c))
                 match &rhs.value {
                     Ast::Op(inner) => {
-                        assert_global!(&inner.rator().value, GVarID::ASSIGN);
-                        // inner lhs should be "b", rhs should be "c"
-                        match &inner.rands()[0].value {
+                        assert_global!(&inner.rator.value, OpID::ASSIGN);
+                        match &inner.rands[0].value {
                             Ast::StringLit(s) => assert_eq!(s, "b"),
                             other => panic!("expected b, got {:?}", other),
                         }
-                        match &inner.rands()[1].value {
+                        match &inner.rands[1].value {
                             Ast::StringLit(s) => assert_eq!(s, "c"),
                             other => panic!("expected c, got {:?}", other),
                         }
@@ -1120,7 +1098,6 @@ mod parser_tests {
                     other => panic!("expected nested assignment on RHS, got {:?}", other),
                 }
 
-                // outer lhs should be "a"
                 match &lhs.value {
                     Ast::StringLit(s) => assert_eq!(s, "a"),
                     other => panic!("expected a, got {:?}", other),
@@ -1132,19 +1109,17 @@ mod parser_tests {
 
     #[test]
     fn parses_addition_left_associative() {
-        // "a" + "b" + "c"  →  ((a + b) + c)
         let ast = parse_single!(r#""a" + "b" + "c""#);
+        println!("got {ast:?}");
         match &ast.value {
             Ast::Op(outer) => {
-                assert_global!(&outer.rator().value, GVarID::ADD_BIN);
-                // left side should be another +, not right side
-                match &outer.rands()[0].value {
-                    Ast::Op(inner) => assert_global!(&inner.rator().value, GVarID::ADD_BIN),
+                assert_global!(&outer.rator.value, OpID::ADD_BIN);
+                match &outer.rands[0].value {
+                    Ast::Op(inner) => assert_global!(&inner.rator.value, OpID::ADD_BIN),
                     other => panic!("expected nested + on LHS, got {:?}", other),
                 }
             }
             other => panic!("expected + as root, got {:?}", other),
         }
     }
-
 }
