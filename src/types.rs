@@ -217,12 +217,18 @@ impl<'a, T> Deref for ThinSlice<'a, T> {
 
 pub struct TypeArena<'a> {
 	pub types:DashMap<Type<'a>,Interned<'a,Type<'a>>>,
-	pub type_slices:DashMap<&'a [Type<'a>],InternedSlice<'a,Type<'a>>>,
-	pub thin_slices:DashMap<InternedSlice<'a,Type<'a>>,ThinSlice<'a,Type<'a>>>,
+	pub thin_slices:DashMap<&'a [Type<'a>],ThinSlice<'a,Type<'a>>>,
 	pub pool:&'a BumpPool
 }
 
 impl<'a> TypeArena<'a>{
+	pub fn new(pool:&'a BumpPool)->Self{
+		Self{
+			pool,
+			types:DashMap::new(),
+			thin_slices:DashMap::new(),
+		}
+	}
 	pub fn get_type(&self,t:Type<'a>)->Interned<'a,Type<'a>>{
 		*self.types.entry(t).or_insert_with(||{
 			let r:&'a Type<'a> = self.pool.get().alloc(t).into_ref();
@@ -231,8 +237,12 @@ impl<'a> TypeArena<'a>{
 	}
 
 	pub fn get_slice(&self,t:&[Type<'a>])->InternedSlice<'a,Type<'a>>{
+		*self.get_thin_slice(t).0
+	}
+
+	pub fn get_thin_slice(&self,t:&[Type<'a>])->ThinSlice<'a,Type<'a>>{
 		//fast path first
-		if let Some(ans) = self.type_slices.get(t){
+		if let Some(ans) = self.thin_slices.get(t){
 			return *ans;
 		}
 
@@ -240,7 +250,7 @@ impl<'a> TypeArena<'a>{
 		let bump = self.pool.get();
 		let checkpoint = bump.checkpoint();
 		let alive = bump.alloc_slice_clone(t).into_ref();
-		match self.type_slices.entry(alive) {
+		match self.thin_slices.entry(alive) {
 		    dashmap::Entry::Occupied(o)=>{
 		    	//we didnt actually need it
 		    	//also allocator is owned by this thread so no other allocs
@@ -248,24 +258,32 @@ impl<'a> TypeArena<'a>{
 		    	*o.get()
 		    }
 		    dashmap::Entry::Vacant(v) => {
-		    	*v.insert(InternedSlice::new_unchecked(alive))
+		    	let fat = InternedSlice::new_unchecked(alive);
+		    	let thin = ThinSlice::new_unchecked(bump.alloc(fat).into_ref());
+		    	*v.insert(thin)
 		    },
 		}
 	}
-	pub fn get_thin_slice(&self,t:&[Type<'a>])->ThinSlice<'a,Type<'a>>{
-		self.to_thin_slice(self.get_slice(t))
-	}
+}
 
-	pub fn to_thin_slice(&self,t:InternedSlice<'a,Type<'a>>)->ThinSlice<'a,Type<'a>>{
-		*self.thin_slices.entry(t).or_insert_with(||{
-			let r = self.pool.get().alloc(t).into_ref();
-			ThinSlice::new_unchecked(r)
-		})
-	}
+#[test]
+fn test_type_lifetimes(){
+	let pool = BumpPool::new();
+	let arena = TypeArena::new(&pool);
+
+	let s1 = arena.get_slice(&[Type::Void]);
+	let s2 = arena.get_slice(&[Type::Tuple(s1)]);
+	let s3 = arena.get_slice(&[Type::Tuple(s1)]);
+	let _ = arena.get_slice(&[Type::Tuple(s2)]);
+
+	assert_eq!(s2,s3);
 }
 
 #[derive(Debug,Copy,Clone,PartialEq,Eq,Hash)]
 pub struct VarID(pub u32);
+
+#[derive(Debug,Copy,Clone,PartialEq,Eq,Hash)]
+pub struct GVarID(pub u32);
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]
 pub enum Type<'a> {
