@@ -409,17 +409,21 @@ pub struct OpCall{
 
 #[derive(Debug, PartialEq)]
 pub enum Ast{
+	/// op is distinguished from function style call
+	/// this allows for piping and similar ideas
 	Op(OpCall),
 
-	/// this is used for calling generated functions
-	/// it is fairly rare
-	DynCall(Box<LocAst>,Box<[LocAst]>),
+	/// this is used for functions
+	Call(Box<LocAst>,Box<[LocAst]>),
+	
+	// basics:
+
 	StringLit(String),
 	Void,
 	IntLit(u64),
 	SignedInt(i64),
 	Var(VarID),
-	GlobalVar(GVarID),//can be function
+	GlobalVar(GVarID),//can't be function
 }
 
 // #[cfg(target_pointer_width = "64")]
@@ -503,39 +507,37 @@ impl PrefixParse for BasicPrefix {
 
 pub struct ParenPrefix;
 
+fn check_paren_closer_error<'a>(closer:&Located<Token<'a>>)->ParseRes<'a,()>{
+	match closer.value {
+		Token::Name(")")=>{
+			Ok(())
+		},
+		Token::Name(t)=>{
+			Err(closer.loc.with(ParseError::ExpectedParenClose(t)))
+		},
+		Token::Str(_)=>{
+			Err(closer.loc.with(ParseError::ExpectedParenCloseString))
+		},
+		Token::Num(_)=>{
+			Err(closer.loc.with(ParseError::ExpectedParenCloseNum))
+		},
+	}
+}
 
 impl PrefixParse for ParenPrefix {
 	fn parse<'a>(&self,my_loc:Loc,parser:&mut Parser<'_,'a>)->ParseRes<'a>{
-		//helper for handeling closing paren
-		let check_closer_error = |closer:&Located<Token<'a>>| {
-			match closer.value {
-				Token::Name(")")=>{
-					Ok(())
-				},
-				Token::Name(t)=>{
-					Err(closer.loc.with(ParseError::ExpectedParenClose(t)))
-				},
-				Token::Str(_)=>{
-					Err(closer.loc.with(ParseError::ExpectedParenCloseString))
-				},
-				Token::Num(_)=>{
-					Err(closer.loc.with(ParseError::ExpectedParenCloseNum))
-				},
-			}
-		};
-
 		//check for ()
-
 		if let Some(loc) = parser.try_name(")")?{
 			let loc = parser.ctx.combine_locs(loc,my_loc).expect("bad parse stack");
 			return Ok(loc.with(Ast::Void));
 		}
 
+		//check for (,)
 		if let Some(_) = parser.try_name(",")?{
 			let Some(closer) = parser.lexer.next()? else {
 				return Err(my_loc.with(ParseError::ExpectedParenCloseEOF))
 			};
-			check_closer_error(&closer)?;
+			check_paren_closer_error(&closer)?;
 
 			let loc = parser.ctx.combine_locs(closer.loc,my_loc).expect("bad parse stack");
 			return Ok(loc.with(Ast::Op(OpCall{
@@ -580,7 +582,7 @@ impl PrefixParse for ParenPrefix {
 				let Some(closer) = parser.lexer.next()? else {
 					return Err(my_loc.with(ParseError::ExpectedParenCloseEOF))
 				};
-				check_closer_error(&closer)?;
+				check_paren_closer_error(&closer)?;
 
 				let loc = parser.ctx.combine_locs(closer.loc,my_loc).expect("bad parse stack");
 				Ok(loc.with(Ast::Op(OpCall{
@@ -589,7 +591,7 @@ impl PrefixParse for ParenPrefix {
 				})))
 			},
 			_=>{
-				check_closer_error(&closer)?;
+				check_paren_closer_error(&closer)?;
 				unreachable!();
 			},
 			
@@ -643,6 +645,58 @@ impl PostfixOp for BasicPostfix {
 		self.bp
 	}
 }
+
+pub fn parse_arg_list<'a>(
+    parser: &mut Parser<'_, 'a>,
+    open_loc: Loc,
+) -> ParseRes<'a, Box<[LocAst]>> {
+    let mut args = Vec::new();
+
+    // Empty argument list: ()
+    if let Some(_) = parser.try_name(")")? {
+        return Ok(Box::from([]));
+    }
+
+    loop {
+        // Parse one argument
+        let Some(arg) = parser.expr_bp(Bp::MIN)? else {
+            return Err(open_loc.with(ParseError::ExpectedValue));
+        };
+        args.push(arg);
+
+        // Check for comma separator
+        if parser.try_name(",")?.is_none() {
+            break;
+        }
+    }
+
+    // Expect closing parenthesis
+    let Some(close) = parser.lexer.next()? else {
+        return Err(open_loc.with(ParseError::ExpectedParenCloseEOF));
+    };
+    check_paren_closer_error(&close)?;
+
+    Ok(args.into())
+}
+
+pub struct CallPostfix;
+
+impl PostfixOp for CallPostfix {
+    fn parse<'a>(
+        &self,
+        my_loc: Loc,
+        lhs: LocAst,
+        parser: &mut Parser<'_, 'a>,
+    ) -> ParseRes<'a> {
+        let args = parse_arg_list(parser, my_loc)?;
+        let loc = parser.ctx.combine_locs(lhs.loc, my_loc).expect("bad parse stack");
+
+        Ok(loc.with(Ast::Call(Box::new(lhs), args)))
+    }
+
+    fn bp(&self) -> Bp { 80 } // same as dot
+}
+
 
 pub enum PostParse {
 	Infix(Box<dyn InfixOp>),
@@ -732,7 +786,7 @@ impl<'me, 'a> Parser<'me, 'a> {
             "(",
             Rc::new(ParseOptions {
                 pre:  Some(Box::new(ParenPrefix)),
-                post: None,
+                post: Some(PostParse::Postfix(Box::new(CallPostfix))),
             }),
         );
 
@@ -1292,7 +1346,7 @@ mod parser_tests {
         }
     }
 
-        #[test]
+    #[test]
     fn parses_unit_expression() {
         // ()
         let ast = parse_single!("()");
@@ -1387,6 +1441,165 @@ mod parser_tests {
                 );
             }
             other => panic!("expected Ast::Op(TUPLE) for '(,)', got {:?}", other),
+        }
+    }
+
+    //CALLS
+        #[test]
+    fn parses_simple_function_call_empty() {
+        // f()
+        let ast = parse_single!(r#""f"()"#);
+        println!("got {ast:?}");
+        match &ast.value {
+            Ast::Call(callee, args) => {
+                match &callee.value {
+                    Ast::StringLit(s) => assert_eq!(s, "f"),
+                    other => panic!("expected callee 'f', got {:?}", other),
+                }
+                assert!(args.is_empty(), "expected no args, got {:?}", args.len());
+            }
+            other => panic!("expected Call AST, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_function_call_with_args() {
+        // f("a", "b")
+        let ast = parse_single!(r#""f"("a","b")"#);
+        println!("got {ast:?}");
+        match &ast.value {
+            Ast::Call(callee, args) => {
+                assert_eq!(args.len(), 2, "expected 2 args, got {}", args.len());
+                match &callee.value {
+                    Ast::StringLit(s) => assert_eq!(s, "f"),
+                    other => panic!("expected callee 'f', got {:?}", other),
+                }
+                match &args[0].value {
+                    Ast::StringLit(s) => assert_eq!(s, "a"),
+                    other => panic!("expected arg1 'a', got {:?}", other),
+                }
+                match &args[1].value {
+                    Ast::StringLit(s) => assert_eq!(s, "b"),
+                    other => panic!("expected arg2 'b', got {:?}", other),
+                }
+            }
+            other => panic!("expected Call AST, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_nested_function_calls() {
+        // f(g("x", "y"))
+        let ast = parse_single!(r#""f"("g"("x","y"))"#);
+        println!("got {ast:?}");
+        match &ast.value {
+            Ast::Call(outer_callee, outer_args) => {
+                assert_eq!(outer_args.len(), 1);
+                match &outer_callee.value {
+                    Ast::StringLit(s) => assert_eq!(s, "f"),
+                    other => panic!("expected outer callee 'f', got {:?}", other),
+                }
+                match &outer_args[0].value {
+                    Ast::Call(inner_callee, inner_args) => {
+                        match &inner_callee.value {
+                            Ast::StringLit(s) => assert_eq!(s, "g"),
+                            other => panic!("expected inner callee 'g', got {:?}", other),
+                        }
+                        let arg_names: Vec<_> = inner_args.iter().map(|a| match &a.value {
+                            Ast::StringLit(s) => s.clone(),
+                            other => panic!("expected string arg, got {:?}", other),
+                        }).collect();
+                        assert_eq!(arg_names, ["x", "y"]);
+                    }
+                    other => panic!("expected inner Call AST, got {:?}", other),
+                }
+            }
+            other => panic!("expected outer Call AST, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_call_and_infix_mixed_precedence() {
+        // f("x") + g("y")
+        let ast = parse_single!(r#""f"("x") + "g"("y")"#);
+        println!("got {ast:?}");
+        match &ast.value {
+            Ast::Op(op) => {
+                assert_global!(&op.rator.value, OpID::ADD_BIN);
+                match &op.rands[0].value {
+                    Ast::Call(callee, _) => match &callee.value {
+                        Ast::StringLit(s) => assert_eq!(s, "f"),
+                        other => panic!("expected left call to 'f', got {:?}", other),
+                    },
+                    other => panic!("expected left operand call, got {:?}", other),
+                }
+                match &op.rands[1].value {
+                    Ast::Call(callee, _) => match &callee.value {
+                        Ast::StringLit(s) => assert_eq!(s, "g"),
+                        other => panic!("expected right call to 'g', got {:?}", other),
+                    },
+                    other => panic!("expected right operand call, got {:?}", other),
+                }
+            }
+            other => panic!("expected + operator at root, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_chained_calls_associative() {
+        // f("a")("b")  →  (f("a"))("b")
+        let ast = parse_single!(r#""f"("a")("b")"#);
+        println!("got {ast:?}");
+        match &ast.value {
+            Ast::Call(outer_callee, outer_args) => {
+                assert_eq!(outer_args.len(), 1);
+                match &outer_callee.value {
+                    Ast::Call(inner_callee, inner_args) => {
+                        assert_eq!(inner_args.len(), 1);
+                        match &inner_callee.value {
+                            Ast::StringLit(s) => assert_eq!(s, "f"),
+                            other => panic!("expected inner callee 'f', got {:?}", other),
+                        }
+                        match &inner_args[0].value {
+                            Ast::StringLit(s) => assert_eq!(s, "a"),
+                            other => panic!("expected arg 'a', got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected nested Call as callee, got {:?}", other),
+                }
+                match &outer_args[0].value {
+                    Ast::StringLit(s) => assert_eq!(s, "b"),
+                    other => panic!("expected arg 'b', got {:?}", other),
+                }
+            }
+            other => panic!("expected Call(AST) chain, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_call_inside_call_argument() {
+        // f(g("a")) → f called with one arg that is g("a")
+        let ast = parse_single!(r#""f"("g"("a"))"#);
+        println!("got {ast:?}");
+        match &ast.value {
+            Ast::Call(outer_callee, outer_args) => {
+                assert_eq!(outer_args.len(), 1);
+                match &outer_args[0].value {
+                    Ast::Call(inner_callee, inner_args) => {
+                        assert_eq!(inner_args.len(), 1);
+                        match &inner_callee.value {
+                            Ast::StringLit(s) => assert_eq!(s, "g"),
+                            other => panic!("expected inner callee 'g', got {:?}", other),
+                        }
+                        match &inner_args[0].value {
+                            Ast::StringLit(s) => assert_eq!(s, "a"),
+                            other => panic!("expected inner arg 'a', got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected inner Call, got {:?}", other),
+                }
+            }
+            other => panic!("expected outer Call, got {:?}", other),
         }
     }
 
