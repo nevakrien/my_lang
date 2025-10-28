@@ -503,12 +503,12 @@ impl PrefixParse for BasicPrefix {
 
 pub trait InfixOp {
 	fn combine(&self,my_loc:Loc,lhs:LocAst,rhs:LocAst)->ParseRes<'static,Ast>;
-	fn bp(&self)->Bp;
+	fn bp(&self)->(Bp,Bp);
 }
 
 pub struct BasicInfix {
 	pub id:GVarID,
-	pub bp:Bp,
+	pub bps:(Bp,Bp),
 }
 
 impl InfixOp for BasicInfix {
@@ -518,8 +518,8 @@ impl InfixOp for BasicInfix {
 		ans.push(rhs);
 		Ok(Ast::Op(ans))
 	}
-	fn bp(&self)->Bp{
-		self.bp
+	fn bp(&self)->(Bp,Bp){
+		self.bps
 	}
 }
 
@@ -597,7 +597,8 @@ impl GVarID {
     // ----- Unary prefix -----
     pub const NEG_PRE:    Self = GVarID(10);  // -x
     pub const DEREF_PRE:  Self = GVarID(11);  // *x
-    pub const NOT_PRE:    Self = GVarID(12);  // !x
+    pub const ADDR_PRE:  Self = GVarID(12);  // &x
+    pub const NOT_PRE:    Self = GVarID(13);  // !x
 
     // ----- Bitwise (binary) -----
     pub const BIT_AND:    Self = GVarID(20);  // &
@@ -626,97 +627,120 @@ impl GVarID {
 
 impl<'me, 'a> Parser<'me, 'a> {
     pub fn new_default(lexer: Lexer<'a>, ctx: &'a SourceContext) -> Self {
-        let mut owned = HashMap::new();
+	    let mut owned = HashMap::new();
 
-        macro_rules! prefix {
-            ($name:expr, $id:expr, $bp:expr) => {
-                owned.insert(
-                    $name,
-                    Rc::new(ParseOptions {
-                        pre:  Some(Box::new(BasicPrefix { id: $id, bp: $bp })),
-                        post: None,
-                    }),
-                );
-            };
-        }
-        macro_rules! infix {
-            ($name:expr, $id:expr, $bp:expr) => {
-                owned.insert(
-                    $name,
-                    Rc::new(ParseOptions {
-                        pre: None,
-                        post: Some(PostParse::Infix(Box::new(BasicInfix { id: $id, bp: $bp }))),
-                    }),
-                );
-            };
-        }
-        macro_rules! both_ids {
-            ($name:expr, $pre_id:expr, $pre_bp:expr, $in_id:expr, $in_bp:expr) => {
-                owned.insert(
-                    $name,
-                    Rc::new(ParseOptions {
-                        pre:  Some(Box::new(BasicPrefix { id: $pre_id, bp: $pre_bp })),
-                        post: Some(PostParse::Infix(Box::new(BasicInfix { id: $in_id, bp: $in_bp }))),
-                    }),
-                );
-            };
-        }
-        macro_rules! postfix {
-            ($name:expr, $id:expr, $bp:expr) => {
-                owned.insert(
-                    $name,
-                    Rc::new(ParseOptions {
-                        pre: None,
-                        post: Some(PostParse::Postfix(Box::new(BasicPostfix { id: $id, bp: $bp }))),
-                    }),
-                );
-            };
-        }
+	    macro_rules! prefix {
+	        ($name:expr, $id:expr, $bp:expr) => {
+	            owned.insert(
+	                $name,
+	                Rc::new(ParseOptions {
+	                    pre:  Some(Box::new(BasicPrefix { id: $id, bp: $bp })),
+	                    post: None,
+	                }),
+	            );
+	        };
+	    }
+	    // infix_left: (bp, bp + 1)
+	    macro_rules! infix_left {
+	        ($name:expr, $id:expr, $bp:expr) => {
+	            owned.insert(
+	                $name,
+	                Rc::new(ParseOptions {
+	                    pre: None,
+	                    post: Some(PostParse::Infix(Box::new(BasicInfix {
+	                        id: $id,
+	                        bps: ($bp, $bp + 1),
+	                    }))),
+	                }),
+	            );
+	        };
+	    }
+	    // infix_right: (bp - 1, bp)
+	    macro_rules! infix_right {
+	        ($name:expr, $id:expr, $bp:expr) => {
+	            owned.insert(
+	                $name,
+	                Rc::new(ParseOptions {
+	                    pre: None,
+	                    post: Some(PostParse::Infix(Box::new(BasicInfix {
+	                        id: $id,
+	                        bps: ($bp , $bp),
+	                    }))),
+	                }),
+	            );
+	        };
+	    }
+	    // both_ids (prefix + infix_left)
+	    macro_rules! both_ids {
+	        ($name:expr, $pre_id:expr, $pre_bp:expr, $in_id:expr, $in_bp:expr) => {
+	            owned.insert(
+	                $name,
+	                Rc::new(ParseOptions {
+	                    pre:  Some(Box::new(BasicPrefix { id: $pre_id, bp: $pre_bp })),
+	                    post: Some(PostParse::Infix(Box::new(BasicInfix {
+	                        id: $in_id,
+	                        bps: ($in_bp, $in_bp + 1),
+	                    }))),
+	                }),
+	            );
+	        };
+	    }
+	    macro_rules! postfix {
+	        ($name:expr, $id:expr, $bp:expr) => {
+	            owned.insert(
+	                $name,
+	                Rc::new(ParseOptions {
+	                    pre: None,
+	                    post: Some(PostParse::Postfix(Box::new(BasicPostfix { id: $id, bp: $bp }))),
+	                }),
+	            );
+	        };
+	    }
 
-        // Binding powers (higher = tighter)
-        // 80: .
-        // 75: postfix (?)
-        // 70: prefix (!, -, *)
-        // 60: * /
-        // 55: << >>
-        // 50: + -
-        // 45: &
-        // 42: ^
-        // 40: |
-        // 30: &&
-        // 25: ||
-        // 20: =
+	    // Binding powers (higher = tighter)
+	    // 80: .
+	    // 75: postfix (?)
+	    // 70: prefix (!, -, *, &, +)
+	    // 60: * /
+	    // 55: << >>
+	    // 50: + -
+	    // 45: &
+	    // 42: ^
+	    // 40: |
+	    // 30: &&
+	    // 25: ||
+	    // 20: =
 
-        // Arithmetic
-        infix!("+",  GVarID::ADD_BIN,    50);                // (no unary +)
-        both_ids!("-", GVarID::NEG_PRE,  70, GVarID::SUB_BIN, 50);
-        both_ids!("*", GVarID::DEREF_PRE,70, GVarID::MUL_BIN, 60);
-        infix!("/",  GVarID::DIV_BIN,    60);
+	    // Arithmetic
+	    infix_left!("+",  GVarID::ADD_BIN,    50);
+	    both_ids!("-", GVarID::NEG_PRE, 70, GVarID::SUB_BIN, 50);
+	    both_ids!("*", GVarID::DEREF_PRE, 70, GVarID::MUL_BIN, 60);
+	    infix_left!("/",  GVarID::DIV_BIN,    60);
 
-        // Bitwise
-        infix!("&",  GVarID::BIT_AND,    45);
-        infix!("^",  GVarID::BIT_XOR,    42);
-        infix!("|",  GVarID::BIT_OR,     40);
-        infix!("<<", GVarID::SHL,        55);
-        infix!(">>", GVarID::SHR,        55);
+	    // Bitwise
+	    both_ids!("&", GVarID::ADDR_PRE, 70, GVarID::BIT_AND, 45);
+	    infix_left!("^",  GVarID::BIT_XOR,    42);
+	    infix_left!("|",  GVarID::BIT_OR,     40);
+	    infix_left!("<<", GVarID::SHL,        55);
+	    infix_left!(">>", GVarID::SHR,        55);
 
-        // Logical
-        prefix!("!",  GVarID::NOT_PRE,   70);
-        infix!("&&",  GVarID::LOG_AND,   30);
-        infix!("||",  GVarID::LOG_OR,    25);
+	    // Logical
+	    prefix!("!",  GVarID::NOT_PRE,   70);
+	    infix_left!("&&",  GVarID::LOG_AND,   30);
+	    infix_left!("||",  GVarID::LOG_OR,    25);
 
-        // Assignment
-        infix!("=",   GVarID::ASSIGN,    20);
+	    // Assignment – right associative
+	    infix_right!("=",   GVarID::ASSIGN,    20);
 
-        // Dot access
-        infix!(".",   GVarID::DOT,       80);
+	    // Dot access – left associative
+	    infix_left!(".",   GVarID::DOT,       80);
 
-        // Postfix
-        postfix!("?", GVarID::QMARK_POST, 75);
+	    // Postfix
+	    postfix!("?", GVarID::QMARK_POST, 75);
 
-        let names = Scope { owned, parent: None };
-        Self { lexer, names, ctx }
-    }
+	    let names = Scope { owned, parent: None };
+	    Self { lexer, names, ctx }
+	}
 
 
 	#[inline(always)]
@@ -778,8 +802,8 @@ impl<'me, 'a> Parser<'me, 'a> {
 
 	        // println!("found postop");
 
-	        let l_bp = match post {
-	            PostParse::Postfix(op) => op.bp(),
+	        let (l_bp,r_bp) = match post {
+	            PostParse::Postfix(op) => (op.bp(),0/*ignored*/),
 	            PostParse::Infix(op) => op.bp(),
 	        };
 
@@ -793,7 +817,7 @@ impl<'me, 'a> Parser<'me, 'a> {
 	            PostParse::Postfix(op) => op.parse(op_tok.loc,lhs, self)?,
 	            PostParse::Infix(op) => {
 	                let rhs = self
-	                    .expr_bp(l_bp)?
+	                    .expr_bp(r_bp)?
 	                    .ok_or(op_tok.with(ParseError::ExpectedValue))?;
 
 
@@ -1066,4 +1090,61 @@ mod parser_tests {
             other => panic!("expected + as root, got {:?}", other),
         }
     }
+
+    #[test]
+    fn parses_assignment_right_associative() {
+        // "a" = "b" = "c"
+        let ast = parse_single!(r#""a" = "b" = "c""#);
+        match &ast.value {
+            Ast::Op(outer) => {
+                // Root operator should be '='
+                assert_global!(&outer.rator().value, GVarID::ASSIGN);
+
+                let lhs = &outer.rands()[0];
+                let rhs = &outer.rands()[1];
+
+                // Right-hand side should itself be another assignment (a = (b = c))
+                match &rhs.value {
+                    Ast::Op(inner) => {
+                        assert_global!(&inner.rator().value, GVarID::ASSIGN);
+                        // inner lhs should be "b", rhs should be "c"
+                        match &inner.rands()[0].value {
+                            Ast::StringLit(s) => assert_eq!(s, "b"),
+                            other => panic!("expected b, got {:?}", other),
+                        }
+                        match &inner.rands()[1].value {
+                            Ast::StringLit(s) => assert_eq!(s, "c"),
+                            other => panic!("expected c, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected nested assignment on RHS, got {:?}", other),
+                }
+
+                // outer lhs should be "a"
+                match &lhs.value {
+                    Ast::StringLit(s) => assert_eq!(s, "a"),
+                    other => panic!("expected a, got {:?}", other),
+                }
+            }
+            other => panic!("expected assignment at root, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parses_addition_left_associative() {
+        // "a" + "b" + "c"  →  ((a + b) + c)
+        let ast = parse_single!(r#""a" + "b" + "c""#);
+        match &ast.value {
+            Ast::Op(outer) => {
+                assert_global!(&outer.rator().value, GVarID::ADD_BIN);
+                // left side should be another +, not right side
+                match &outer.rands()[0].value {
+                    Ast::Op(inner) => assert_global!(&inner.rator().value, GVarID::ADD_BIN),
+                    other => panic!("expected nested + on LHS, got {:?}", other),
+                }
+            }
+            other => panic!("expected + as root, got {:?}", other),
+        }
+    }
+
 }
