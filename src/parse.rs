@@ -379,6 +379,18 @@ pub enum ParseError<'a> {
 
     #[error("expected a value after this found end of expression")]
     ExpectedValue,
+
+    #[error("expected \")\" found \"{0}\"")]
+    ExpectedParenClose(&'a str),
+
+    #[error("expected \")\" found string")]
+    ExpectedParenCloseString,
+
+    #[error("expected \")\" found number")]
+    ExpectedParenCloseNum,
+
+    #[error("expected \")\" found EOF")]
+    ExpectedParenCloseEOF,
 }
 
 pub type ParseRes<'a, T = LocAst> = Result<T, Located<ParseError<'a>>>;
@@ -485,6 +497,38 @@ impl PrefixParse for BasicPrefix {
 		})))
 	}
 
+}
+
+pub struct ParenPrefix;
+
+impl PrefixParse for ParenPrefix {
+	fn parse<'a>(&self,my_loc:Loc,parser:&mut Parser<'_,'a>)->ParseRes<'a>{
+		let Some(lhs) = parser.expr_bp(Bp::MIN)? else {
+			return Err(my_loc.with(ParseError::ExpectedValue))
+		};
+
+		let Some(closer) = parser.lexer.next()? else {
+			return Err(my_loc.with(ParseError::ExpectedParenCloseEOF))
+		};
+
+		match closer.value {
+			Token::Name(")")=>{},
+			Token::Name(t)=>{
+				return Err(closer.loc.with(ParseError::ExpectedParenClose(t)));
+			},
+			Token::Str(_)=>{
+				return Err(closer.loc.with(ParseError::ExpectedParenCloseString));
+			},
+			Token::Num(_)=>{
+				return Err(closer.loc.with(ParseError::ExpectedParenCloseNum));
+			},
+		}
+
+		let loc = parser.ctx.combine_locs(closer.loc,my_loc).expect("bad parse stack");
+		
+
+		Ok(loc.with(lhs.value))
+	}
 }
 
 pub trait InfixOp {
@@ -614,6 +658,15 @@ impl OpID {
 impl<'me, 'a> Parser<'me, 'a> {
     pub fn new_default(lexer: Lexer<'a>, ctx: &'a SourceContext) -> Self {
 	    let mut owned = HashMap::new();
+
+	    //parens
+	    owned.insert(
+            "(",
+            Rc::new(ParseOptions {
+                pre:  Some(Box::new(ParenPrefix)),
+                post: None,
+            }),
+        );
 
 	    macro_rules! prefix {
 	        ($name:expr, $id:expr, $bp:expr) => {
@@ -1004,23 +1057,23 @@ mod parser_tests {
         }
     }
 
-    // #[test]
-    // fn parses_logical_and_grouping() {
-    //     let ast = parse_single!(r#"!("a" && "b") || "c""#);
-    //     println!("got {ast:?}");
-    //     match &ast.value {
-    //         Ast::Op(or_op) => {
-    //             assert_global!(&or_op.rator.value, OpID::LOG_OR);
-    //             let left = &or_op.rands[0];
-    //             if let Ast::Op(not_op) = &left.value {
-    //                 assert_global!(&not_op.rator.value, OpID::NOT_PRE);
-    //             } else {
-    //                 panic!("expected prefix !, got {:?}", left.value);
-    //             }
-    //         }
-    //         other => panic!("expected || as root, got {:?}", other),
-    //     }
-    // }
+    #[test]
+    fn parses_logical_and_grouping() {
+        let ast = parse_single!(r#"!("a" && "b") || "c""#);
+        println!("got {ast:?}");
+        match &ast.value {
+            Ast::Op(or_op) => {
+                assert_global!(&or_op.rator.value, OpID::LOG_OR);
+                let left = &or_op.rands[0];
+                if let Ast::Op(not_op) = &left.value {
+                    assert_global!(&not_op.rator.value, OpID::NOT_PRE);
+                } else {
+                    panic!("expected prefix !, got {:?}", left.value);
+                }
+            }
+            other => panic!("expected || as root, got {:?}", other),
+        }
+    }
 
     #[test]
     fn parses_assignment() {
