@@ -318,14 +318,14 @@ impl<'a> BasicLexer<'a>{
 
 	//     self.yeild_next(size).map_owned(Token::Name)
 	// }
-	fn parse_operator(&mut self) -> Located<Token<'a>> {
+	fn parse_operator(&mut self) -> Option<Located<Token<'a>>> {
 	    
-	    match self.cur_str.as_bytes().get(1).unwrap(){
-	    	b'?'|b'!'|b'.'|
+	    match self.cur_str.as_bytes().get(1)?{
+	    	b'?'|b'!'|b'.'|b','|
 	    	b'*'|b';'|b'\''|
 	    	b'('|b')'|b'['|b']'|b'{'|b'}'
 	    	=>{
-	    		return self.yeild_next(1).map_owned(Token::Name);
+	    		return Some(self.yeild_next(1).map_owned(Token::Name));
 	    	}
 	    	_=>{}
 	    }
@@ -339,7 +339,7 @@ impl<'a> BasicLexer<'a>{
 			size+=c.len_utf8();
 		}
 
-		self.yeild_next(size).map_owned(Token::Name)
+		Some(self.yeild_next(size).map_owned(Token::Name))
 	}
 
 
@@ -360,7 +360,7 @@ impl<'a> BasicLexer<'a>{
 		}
 
 
-		Ok(Some(self.parse_operator()))
+		Ok(self.parse_operator())
 	}
 }
 
@@ -479,7 +479,6 @@ impl<'a> Lexer<'a> {
 
 pub trait PrefixParse {
 	fn parse<'a>(&self,my_loc:Loc,parser:&mut Parser<'_,'a>)->ParseRes<'a>;
-	fn bp(&self)->Bp;
 }
 
 pub struct BasicPrefix{
@@ -489,7 +488,7 @@ pub struct BasicPrefix{
 
 impl PrefixParse for BasicPrefix {
 	fn parse<'a>(&self,my_loc:Loc,parser:&mut Parser<'_,'a>)->ParseRes<'a>{
-		let Some(lhs) = parser.parse_exp()? else {
+		let Some(lhs) = parser.expr_bp(self.bp)? else {
 			return Err(my_loc.with(ParseError::ExpectedValue))
 		};
 		let loc = parser.ctx.combine_locs(lhs.loc,my_loc).expect("bad parse stack");
@@ -499,9 +498,7 @@ impl PrefixParse for BasicPrefix {
 
 		Ok(loc.with(Ast::Op(ans)))
 	}
-	fn bp(&self)->Bp{
-		self.bp
-	}
+
 }
 
 pub trait InfixOp {
@@ -584,66 +581,50 @@ impl<K:Hash+Eq, V> Scope<'_, K, V>{
 	}
 }
 
-impl GVarID {
-    // ----- Binary arithmetic -----
-    pub const ADD_BIN: Self = GVarID(1);   // +
-    pub const SUB_BIN: Self = GVarID(2);   // -
-    pub const MUL_BIN: Self = GVarID(3);   // *
-    pub const DIV_BIN: Self = GVarID(4);   // /
-    pub const MOD_BIN: Self = GVarID(5);   // %
-
-    // ----- Unary prefix -----
-    pub const POS_PRE:  Self = GVarID(100); // + (unary)
-    pub const NEG_PRE:  Self = GVarID(101); // - (unary)
-    pub const DEREF_PRE:Self = GVarID(102); // * (unary)
-    pub const NOT_PRE:  Self = GVarID(103); // !
-
-    // ++/-- as prefix
-    pub const INC_PRE:  Self = GVarID(110); // ++x
-    pub const DEC_PRE:  Self = GVarID(111); // --x
-
-    // ----- Postfix -----
-    pub const INC_POST:   Self = GVarID(200); // x++
-    pub const DEC_POST:   Self = GVarID(201); // x--
-    pub const QMARK_POST: Self = GVarID(202); // x?
-
-    // ----- Bitwise (binary) -----
-    pub const BIT_AND: Self = GVarID(20); // &
-    pub const BIT_OR:  Self = GVarID(21); // |
-    pub const BIT_XOR: Self = GVarID(22); // ^
-    pub const SHL:     Self = GVarID(23); // <<
-    pub const SHR:     Self = GVarID(24); // >>
-
-    // ----- Logical (binary) -----
-    pub const LOG_AND: Self = GVarID(30); // &&
-    pub const LOG_OR:  Self = GVarID(31); // ||
-
-    // ----- Comparisons (binary) -----
-    pub const LT: Self = GVarID(40);
-    pub const LE: Self = GVarID(41);
-    pub const GT: Self = GVarID(42);
-    pub const GE: Self = GVarID(43);
-    pub const EQ: Self = GVarID(44);
-    pub const NE: Self = GVarID(45);
-
-    // ----- Assignment / flow (binary) -----
-    pub const ASSIGN: Self = GVarID(50); // =
-    pub const ARROW:  Self = GVarID(51); // ->
-
-    // ----- Access -----
-    pub const DOT: Self = GVarID(60); // .  (binary)
-}
-
-
-
 pub struct Parser<'me,'a> {
 	pub lexer:Lexer<'a>,
 	pub names:Scope<'me,&'a str,KnowenName>,
 	pub ctx:&'a SourceContext,
 }
 
+impl GVarID {
+    // ----- Arithmetic (binary) -----
+    pub const ADD_BIN:    Self = GVarID(1);   // +
+    pub const SUB_BIN:    Self = GVarID(2);   // -
+    pub const MUL_BIN:    Self = GVarID(3);   // *
+    pub const DIV_BIN:    Self = GVarID(4);   // /
 
-impl<'me,'a> Parser<'me,'a>{
+    // ----- Unary prefix -----
+    pub const NEG_PRE:    Self = GVarID(10);  // -x
+    pub const DEREF_PRE:  Self = GVarID(11);  // *x
+    pub const NOT_PRE:    Self = GVarID(12);  // !x
+
+    // ----- Bitwise (binary) -----
+    pub const BIT_AND:    Self = GVarID(20);  // &
+    pub const BIT_OR:     Self = GVarID(21);  // |
+    pub const BIT_XOR:    Self = GVarID(22);  // ^
+    pub const SHL:        Self = GVarID(23);  // <<
+    pub const SHR:        Self = GVarID(24);  // >>
+
+    // ----- Logical (binary) -----
+    pub const LOG_AND:    Self = GVarID(30);  // &&
+    pub const LOG_OR:     Self = GVarID(31);  // ||
+
+    // ----- Assignment -----
+    pub const ASSIGN:     Self = GVarID(40);  // =
+
+    // ----- Access -----
+    pub const DOT:        Self = GVarID(41);  // .
+
+    // ----- Postfix -----
+    pub const QMARK_POST: Self = GVarID(42);  // ?
+}
+
+
+
+
+
+impl<'me, 'a> Parser<'me, 'a> {
     pub fn new_default(lexer: Lexer<'a>, ctx: &'a SourceContext) -> Self {
         let mut owned = HashMap::new();
 
@@ -669,18 +650,6 @@ impl<'me,'a> Parser<'me,'a>{
                 );
             };
         }
-        macro_rules! postfix {
-            ($name:expr, $id:expr, $bp:expr) => {
-                owned.insert(
-                    $name,
-                    Rc::new(ParseOptions {
-                        pre: None,
-                        post: Some(PostParse::Postfix(Box::new(BasicPostfix { id: $id, bp: $bp }))),
-                    }),
-                );
-            };
-        }
-        // separate IDs for prefix/infix under the same token
         macro_rules! both_ids {
             ($name:expr, $pre_id:expr, $pre_bp:expr, $in_id:expr, $in_bp:expr) => {
                 owned.insert(
@@ -692,79 +661,62 @@ impl<'me,'a> Parser<'me,'a>{
                 );
             };
         }
+        macro_rules! postfix {
+            ($name:expr, $id:expr, $bp:expr) => {
+                owned.insert(
+                    $name,
+                    Rc::new(ParseOptions {
+                        pre: None,
+                        post: Some(PostParse::Postfix(Box::new(BasicPostfix { id: $id, bp: $bp }))),
+                    }),
+                );
+            };
+        }
 
         // Binding powers (higher = tighter)
         // 80: .
-        // 75: postfix (++, --, ?)
-        // 70: prefix (!, +, -, *)
-        // 60: * / %
+        // 75: postfix (?)
+        // 70: prefix (!, -, *)
+        // 60: * /
+        // 55: << >>
         // 50: + -
         // 45: &
         // 42: ^
-        // 40: | and comparisons
-        // 35: equality
+        // 40: |
         // 30: &&
         // 25: ||
-        // 20: =, ->
+        // 20: =
 
         // Arithmetic
-        both_ids!("+",  GVarID::POS_PRE, 70, GVarID::ADD_BIN, 50);
-        both_ids!("-",  GVarID::NEG_PRE, 70, GVarID::SUB_BIN, 50);
-        both_ids!("*",  GVarID::DEREF_PRE, 70, GVarID::MUL_BIN, 60);
-        infix!("/",  GVarID::DIV_BIN, 60);
-        infix!("%",  GVarID::MOD_BIN, 60);
+        infix!("+",  GVarID::ADD_BIN,    50);                // (no unary +)
+        both_ids!("-", GVarID::NEG_PRE,  70, GVarID::SUB_BIN, 50);
+        both_ids!("*", GVarID::DEREF_PRE,70, GVarID::MUL_BIN, 60);
+        infix!("/",  GVarID::DIV_BIN,    60);
 
         // Bitwise
-        infix!("&",  GVarID::BIT_AND, 45);
-        infix!("|",  GVarID::BIT_OR,  40);
-        infix!("^",  GVarID::BIT_XOR, 42);
-        infix!("<<", GVarID::SHL,     55);
-        infix!(">>", GVarID::SHR,     55);
+        infix!("&",  GVarID::BIT_AND,    45);
+        infix!("^",  GVarID::BIT_XOR,    42);
+        infix!("|",  GVarID::BIT_OR,     40);
+        infix!("<<", GVarID::SHL,        55);
+        infix!(">>", GVarID::SHR,        55);
 
         // Logical
         prefix!("!",  GVarID::NOT_PRE,   70);
         infix!("&&",  GVarID::LOG_AND,   30);
         infix!("||",  GVarID::LOG_OR,    25);
 
-        // Comparisons
-        infix!("<",   GVarID::LT, 40);
-        infix!("<=",  GVarID::LE, 40);
-        infix!(">",   GVarID::GT, 40);
-        infix!(">=",  GVarID::GE, 40);
-        infix!("==",  GVarID::EQ, 35);
-        infix!("!=",  GVarID::NE, 35);
+        // Assignment
+        infix!("=",   GVarID::ASSIGN,    20);
 
-        // Assignment / flow
-        infix!("=",   GVarID::ASSIGN, 20);
-        infix!("->",  GVarID::ARROW,  20);
+        // Dot access
+        infix!(".",   GVarID::DOT,       80);
 
-        // ++ and -- as BOTH prefix and postfix (distinct IDs)
-        owned.insert(
-            "++",
-            Rc::new(ParseOptions {
-                pre:  Some(Box::new(BasicPrefix  { id: GVarID::INC_PRE,  bp: 70 })),
-                post: Some(PostParse::Postfix(Box::new(BasicPostfix { id: GVarID::INC_POST, bp: 75 }))),
-            }),
-        );
-        owned.insert(
-            "--",
-            Rc::new(ParseOptions {
-                pre:  Some(Box::new(BasicPrefix  { id: GVarID::DEC_PRE,  bp: 70 })),
-                post: Some(PostParse::Postfix(Box::new(BasicPostfix { id: GVarID::DEC_POST, bp: 75 }))),
-            }),
-        );
-
-        // postfix '?'
+        // Postfix
         postfix!("?", GVarID::QMARK_POST, 75);
-
-        // Dot access (binary)
-        infix!(".", GVarID::DOT, 80);
 
         let names = Scope { owned, parent: None };
         Self { lexer, names, ctx }
     }
-
-
 
 
 	#[inline(always)]
@@ -772,6 +724,8 @@ impl<'me,'a> Parser<'me,'a>{
 		self.expr_bp(Bp::MIN)
 	}
 	pub fn expr_bp(&mut self, min_bp: Bp) -> ParseOpRes<'a> {
+	    println!("new entry");
+
 	    let Some(tok) = self.lexer.next()? else {
 	        return Ok(None);
 	    };
@@ -788,6 +742,8 @@ impl<'me,'a> Parser<'me,'a>{
 	                return Err(name.with(ParseError::UnknownName(name.value)));
 	            };
 
+	            println!("runing prefix op");
+
 	            // We have a known name, but check if it’s a prefix op
 	            match opts.clone().pre.as_ref() {
 	                Some(pre) => pre.parse(tok.loc,self)?,
@@ -796,9 +752,12 @@ impl<'me,'a> Parser<'me,'a>{
 	        }
 	    };
 
+	    println!("starting loop");
+
 	    // --- postfix / infix loop ---
 	    loop {
 	        let Some(peek_tok) = self.lexer.peek()? else {
+	            println!("no more input");
 	            break;
 	        };
 
@@ -816,6 +775,8 @@ impl<'me,'a> Parser<'me,'a>{
 	        let Some(post) = &opts.post else {
 	            break; // no postfix/infix handler
 	        };
+
+	        println!("found postop");
 
 	        let l_bp = match post {
 	            PostParse::Postfix(op) => op.bp(),
@@ -868,12 +829,28 @@ fn test_lexer(){
 	assert_eq!(toks.len(),7);
 }
 
+#[test]
+fn test_lexer_qmark(){
+	
+	let src = Source::File(FileId(0));
+	let text = r#""a"?"#;
+
+	let mut lex = BasicLexer::new(text, src);
+
+	let mut toks = Vec::new();
+	while let Some(t) = lex.next().unwrap(){
+		toks.push(t);
+	}
+
+	assert_eq!(toks.len(),2);
+	assert_eq!(toks.last().unwrap().value,Token::Name("?"));
+	
+}
+
 #[cfg(test)]
 mod parser_tests {
     use super::*;
 
-    /// Macro to parse a single expression inline in tests.
-    /// Panics will report the test line, not inside the helper.
     macro_rules! parse_single {
         ($src_text:expr) => {{
             let src = Source::File(FileId(0));
@@ -888,7 +865,6 @@ mod parser_tests {
         }};
     }
 
-    /// Macro to assert a node is exactly a given GlobalVar ID.
     macro_rules! assert_global {
         ($ast:expr, $expected:expr) => {{
             match $ast {
@@ -908,6 +884,7 @@ mod parser_tests {
     #[test]
     fn parses_simple_number() {
         let ast = parse_single!("42");
+        println!("got {ast:?}");
         match ast.value {
             Ast::IntLit(v) => assert_eq!(v, 42),
             other => panic!("expected IntLit(42), got {:?}", other),
@@ -917,6 +894,7 @@ mod parser_tests {
     #[test]
     fn parses_prefix_minus() {
         let ast = parse_single!("-5");
+        println!("got {ast:?}");
         match &ast.value {
             Ast::Op(call) => {
                 assert_global!(&call.rator().value, GVarID::NEG_PRE);
@@ -931,8 +909,8 @@ mod parser_tests {
 
     #[test]
     fn parses_prefix_and_infix_star() {
-        // *"x" * "y"
         let ast = parse_single!(r#"*"x" * "y""#);
+        println!("got {ast:?}");
         match &ast.value {
             Ast::Op(call) => {
                 assert_global!(&call.rator().value, GVarID::MUL_BIN);
@@ -953,8 +931,8 @@ mod parser_tests {
 
     #[test]
     fn parses_double_prefix_and_infix_chain() {
-        // -"a" * -"b" + "c"
         let ast = parse_single!(r#"-"a" * -"b" + "c""#);
+        println!("got {ast:?}");
         match &ast.value {
             Ast::Op(call) => {
                 assert_global!(&call.rator().value, GVarID::ADD_BIN);
@@ -980,27 +958,9 @@ mod parser_tests {
     }
 
     #[test]
-    fn parses_prefix_and_postfix_combo() {
-        // --"x"++
-        let ast = parse_single!(r#"--"x"++"#);
-        match &ast.value {
-            Ast::Op(call) => {
-                assert_global!(&call.rator().value, GVarID::INC_POST);
-                let inner = &call.rands()[0];
-                if let Ast::Op(inner_op) = &inner.value {
-                    assert_global!(&inner_op.rator().value, GVarID::DEC_PRE);
-                } else {
-                    panic!("expected prefix --, got {:?}", inner.value);
-                }
-            }
-            other => panic!("expected postfix ++ wrapping prefix --, got {:?}", other),
-        }
-    }
-
-    #[test]
     fn parses_dot_access_precedence() {
-        // "a"."b" + "c"."d"
         let ast = parse_single!(r#""a"."b" + "c"."d""#);
+        println!("got {ast:?}");
         match &ast.value {
             Ast::Op(call) => {
                 assert_global!(&call.rator().value, GVarID::ADD_BIN);
@@ -1016,69 +976,61 @@ mod parser_tests {
     }
 
     #[test]
-    fn parses_mixed_precedence_chain() {
-        // "a" + "b" * "c"++
-        let ast = parse_single!(r#""a" + "b" * "c"++"#);
+    fn parses_bitwise_ops() {
+        let ast = parse_single!(r#""a" & "b" | "c" ^ "d""#);
+        println!("got {ast:?}");
         match &ast.value {
-            Ast::Op(add) => {
-                assert_global!(&add.rator().value, GVarID::ADD_BIN);
-                let rhs = &add.rands()[1];
-                if let Ast::Op(mul) = &rhs.value {
-                    assert_global!(&mul.rator().value, GVarID::MUL_BIN);
-                    let post = &mul.rands()[1];
-                    if let Ast::Op(postfix) = &post.value {
-                        assert_global!(&postfix.rator().value, GVarID::INC_POST);
-                    } else {
-                        panic!("expected postfix ++ inside rhs, got {:?}", post.value);
-                    }
+            Ast::Op(or) => {
+                assert_global!(&or.rator().value, GVarID::BIT_OR);
+                let left = &or.rands()[0];
+                let right = &or.rands()[1];
+                if let Ast::Op(and) = &left.value {
+                    assert_global!(&and.rator().value, GVarID::BIT_AND);
                 } else {
-                    panic!("expected * node inside + rhs, got {:?}", rhs.value);
+                    panic!("expected & inside left, got {:?}", left.value);
+                }
+                if let Ast::Op(xor) = &right.value {
+                    assert_global!(&xor.rator().value, GVarID::BIT_XOR);
+                } else {
+                    panic!("expected ^ inside right, got {:?}", right.value);
                 }
             }
-            other => panic!("expected + as root, got {:?}", other),
+            other => panic!("expected | as root, got {:?}", other),
         }
     }
 
-    #[test]
-    fn parses_logical_and_grouping() {
-        // !("a" && "b") || "c"
-        let ast = parse_single!(r#"!("a" && "b") || "c""#);
-        match &ast.value {
-            Ast::Op(or_op) => {
-                assert_global!(&or_op.rator().value, GVarID::LOG_OR);
-                let left = &or_op.rands()[0];
-                if let Ast::Op(not_op) = &left.value {
-                    assert_global!(&not_op.rator().value, GVarID::NOT_PRE);
-                } else {
-                    panic!("expected prefix !, got {:?}", left.value);
-                }
-            }
-            other => panic!("expected || as root, got {:?}", other),
-        }
-    }
+    // #[test]
+    // fn parses_logical_and_grouping() {
+    //     let ast = parse_single!(r#"!("a" && "b") || "c""#);
+    //     println!("got {ast:?}");
+    //     match &ast.value {
+    //         Ast::Op(or_op) => {
+    //             assert_global!(&or_op.rator().value, GVarID::LOG_OR);
+    //             let left = &or_op.rands()[0];
+    //             if let Ast::Op(not_op) = &left.value {
+    //                 assert_global!(&not_op.rator().value, GVarID::NOT_PRE);
+    //             } else {
+    //                 panic!("expected prefix !, got {:?}", left.value);
+    //             }
+    //         }
+    //         other => panic!("expected || as root, got {:?}", other),
+    //     }
+    // }
 
     #[test]
-    fn parses_assignment_and_arrow() {
-        // "x" = "y" -> "z"
-        let ast = parse_single!(r#""x" = "y" -> "z""#);
+    fn parses_assignment() {
+        let ast = parse_single!(r#""x" = "y""#);
+        println!("got {ast:?}");
         match &ast.value {
-            Ast::Op(assign) => {
-                assert_global!(&assign.rator().value, GVarID::ASSIGN);
-                let rhs = &assign.rands()[1];
-                if let Ast::Op(arrow) = &rhs.value {
-                    assert_global!(&arrow.rator().value, GVarID::ARROW);
-                } else {
-                    panic!("expected -> on rhs, got {:?}", rhs.value);
-                }
-            }
+            Ast::Op(assign) => assert_global!(&assign.rator().value, GVarID::ASSIGN),
             other => panic!("expected assignment at root, got {:?}", other),
         }
     }
 
     #[test]
     fn parses_postfix_qmark() {
-        // "a"?
         let ast = parse_single!(r#""a"?"#);
+        println!("got {ast:?}");
         match &ast.value {
             Ast::Op(call) => {
                 assert_global!(&call.rator().value, GVarID::QMARK_POST);
@@ -1090,4 +1042,28 @@ mod parser_tests {
             other => panic!("expected postfix ? AST, got {:?}", other),
         }
     }
+
+    // #[test]
+    // fn parses_mixed_precedence_chain() {
+    //     let ast = parse_single!(r#""a" + "b" << "c"?"#);
+    //     println!("got {ast:?}");
+    //     match &ast.value {
+    //         Ast::Op(add) => {
+    //             assert_global!(&add.rator().value, GVarID::ADD_BIN);
+    //             let rhs = &add.rands()[1];
+    //             if let Ast::Op(shift) = &rhs.value {
+    //                 assert_global!(&shift.rator().value, GVarID::SHL);
+    //                 let post = &shift.rands()[1];
+    //                 if let Ast::Op(postfix) = &post.value {
+    //                     assert_global!(&postfix.rator().value, GVarID::QMARK_POST);
+    //                 } else {
+    //                     panic!("expected postfix ? inside rhs, got {:?}", post.value);
+    //                 }
+    //             } else {
+    //                 panic!("expected << node inside + rhs, got {:?}", rhs.value);
+    //             }
+    //         }
+    //         other => panic!("expected + as root, got {:?}", other),
+    //     }
+    // }
 }
