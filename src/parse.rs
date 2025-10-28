@@ -1,9 +1,7 @@
-use either::Either;
 use crate::types::GVarID;
 use crate::input::SourceContext;
 use crate::types::VarID;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::hash::Hash;
 use thiserror::Error;
 use std::collections::HashMap;
@@ -1582,7 +1580,7 @@ mod parser_tests {
         let ast = parse_single!(r#""f"("g"("a"))"#);
         println!("got {ast:?}");
         match &ast.value {
-            Ast::Call(outer_callee, outer_args) => {
+            Ast::Call(_outer_callee, outer_args) => {
                 assert_eq!(outer_args.len(), 1);
                 match &outer_args[0].value {
                     Ast::Call(inner_callee, inner_args) => {
