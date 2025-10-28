@@ -320,7 +320,7 @@ impl<'a> BasicLexer<'a>{
 	// }
 	fn parse_operator(&mut self) -> Option<Located<Token<'a>>> {
 	    
-	    match self.cur_str.as_bytes().get(1)?{
+	    match self.cur_str.as_bytes().get(0)?{
 	    	b'?'|b'!'|b'.'|b','|
 	    	b'*'|b';'|b'\''|
 	    	b'('|b')'|b'['|b']'|b'{'|b'}'
@@ -724,7 +724,7 @@ impl<'me, 'a> Parser<'me, 'a> {
 		self.expr_bp(Bp::MIN)
 	}
 	pub fn expr_bp(&mut self, min_bp: Bp) -> ParseOpRes<'a> {
-	    println!("new entry");
+	    // println!("new entry");
 
 	    let Some(tok) = self.lexer.next()? else {
 	        return Ok(None);
@@ -742,7 +742,7 @@ impl<'me, 'a> Parser<'me, 'a> {
 	                return Err(name.with(ParseError::UnknownName(name.value)));
 	            };
 
-	            println!("runing prefix op");
+	            // println!("runing prefix op");
 
 	            // We have a known name, but check if it’s a prefix op
 	            match opts.clone().pre.as_ref() {
@@ -752,12 +752,12 @@ impl<'me, 'a> Parser<'me, 'a> {
 	        }
 	    };
 
-	    println!("starting loop");
+	    // println!("starting loop");
 
 	    // --- postfix / infix loop ---
 	    loop {
 	        let Some(peek_tok) = self.lexer.peek()? else {
-	            println!("no more input");
+	            // println!("no more input");
 	            break;
 	        };
 
@@ -776,7 +776,7 @@ impl<'me, 'a> Parser<'me, 'a> {
 	            break; // no postfix/infix handler
 	        };
 
-	        println!("found postop");
+	        // println!("found postop");
 
 	        let l_bp = match post {
 	            PostParse::Postfix(op) => op.bp(),
@@ -844,7 +844,7 @@ fn test_lexer_qmark(){
 
 	assert_eq!(toks.len(),2);
 	assert_eq!(toks.last().unwrap().value,Token::Name("?"));
-	
+
 }
 
 #[cfg(test)]
@@ -1043,27 +1043,27 @@ mod parser_tests {
         }
     }
 
-    // #[test]
-    // fn parses_mixed_precedence_chain() {
-    //     let ast = parse_single!(r#""a" + "b" << "c"?"#);
-    //     println!("got {ast:?}");
-    //     match &ast.value {
-    //         Ast::Op(add) => {
-    //             assert_global!(&add.rator().value, GVarID::ADD_BIN);
-    //             let rhs = &add.rands()[1];
-    //             if let Ast::Op(shift) = &rhs.value {
-    //                 assert_global!(&shift.rator().value, GVarID::SHL);
-    //                 let post = &shift.rands()[1];
-    //                 if let Ast::Op(postfix) = &post.value {
-    //                     assert_global!(&postfix.rator().value, GVarID::QMARK_POST);
-    //                 } else {
-    //                     panic!("expected postfix ? inside rhs, got {:?}", post.value);
-    //                 }
-    //             } else {
-    //                 panic!("expected << node inside + rhs, got {:?}", rhs.value);
-    //             }
-    //         }
-    //         other => panic!("expected + as root, got {:?}", other),
-    //     }
-    // }
+    #[test]
+    fn parses_mixed_precedence_chain() {
+        let ast = parse_single!(r#""a" + "b" << "c"?"#);
+        println!("got {ast:?}");
+        match &ast.value {
+            Ast::Op(add) => {
+                assert_global!(&add.rator().value, GVarID::ADD_BIN);
+                let rhs = &add.rands()[1];
+                if let Ast::Op(shift) = &rhs.value {
+                    assert_global!(&shift.rator().value, GVarID::SHL);
+                    let post = &shift.rands()[1];
+                    if let Ast::Op(postfix) = &post.value {
+                        assert_global!(&postfix.rator().value, GVarID::QMARK_POST);
+                    } else {
+                        panic!("expected postfix ? inside rhs, got {:?}", post.value);
+                    }
+                } else {
+                    panic!("expected << node inside + rhs, got {:?}", rhs.value);
+                }
+            }
+            other => panic!("expected + as root, got {:?}", other),
+        }
+    }
 }
